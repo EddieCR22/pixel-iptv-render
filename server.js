@@ -8,6 +8,8 @@ const PORT = Number(process.env.PORT || 10000);
 const UPSTREAM_BASE = String(process.env.UPSTREAM_BASE || "").replace(/\/+$/g, "");
 const TOKEN_SECRET = String(process.env.TOKEN_SECRET || "");
 const ALLOWED_ORIGIN = String(process.env.ALLOWED_ORIGIN || "*");
+const PLAYER_REFERER = String(process.env.PLAYER_REFERER || "https://nubweb.nubservices.com/");
+const PLAYER_ORIGIN = String(process.env.PLAYER_ORIGIN || "https://nubweb.nubservices.com");
 
 function corsHeaders(extra = {}) {
   return {
@@ -188,12 +190,50 @@ function looksLikeManifest(ct, url) {
   return x.includes("mpegurl") || x.includes("m3u8") || /\.m3u8(?:$|\?)/i.test(url);
 }
 
+function streamHeaderProfiles() {
+  return [
+    {
+      id: "vlc",
+      ua: "VLC/3.0.21 LibVLC/3.0.21"
+    },
+    {
+      id: "exo",
+      ua: "ExoPlayerLib/2.19.1 (Linux;Android 13) ExoPlayer"
+    },
+    {
+      id: "browser",
+      ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+      referer: PLAYER_REFERER,
+      origin: PLAYER_ORIGIN
+    },
+    {
+      id: "androidtv",
+      ua: "Mozilla/5.0 (Linux; Android 12; Android TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      referer: PLAYER_REFERER,
+      origin: PLAYER_ORIGIN
+    }
+  ];
+}
+
+function profileById(id) {
+  return streamHeaderProfiles().find(x => x.id === id) || streamHeaderProfiles()[0];
+}
+
 function upstreamHeaders(req, options = {}) {
   const h = new Headers();
+  const profile = options.profile || profileById(options.profileId);
   h.set("Accept", req.headers.accept || "*/*");
-  h.set("User-Agent", options.userAgent || "VLC/3.0.21 LibVLC/3.0.21");
+  h.set("User-Agent", options.userAgent || profile.ua || "VLC/3.0.21 LibVLC/3.0.21");
+
+  if (profile.referer) h.set("Referer", profile.referer);
+  if (profile.origin) h.set("Origin", profile.origin);
+
+  h.set("Accept-Language", "es-419,es;q=0.9,en;q=0.7");
+  h.set("Connection", "keep-alive");
+
   const range = req.headers.range;
   if (range && options.allowRange !== false) h.set("Range", range);
+
   return h;
 }
 
@@ -203,6 +243,38 @@ async function proxyFetch(target, req, options = {}) {
     headers: upstreamHeaders(req, options),
     redirect: "follow"
   });
+}
+
+async function tryTargetProfiles(target, req, preferredProfileId = "") {
+  const all = streamHeaderProfiles();
+  const profiles = preferredProfileId
+    ? [profileById(preferredProfileId), ...all.filter(x => x.id !== preferredProfileId)]
+    : all;
+
+  const attempts = [];
+  for (const profile of profiles) {
+    let r;
+    try {
+      r = await proxyFetch(target, req, { profile });
+    } catch (e) {
+      attempts.push({ profile: profile.id, status: 0, error: e?.message || "fetch" });
+      continue;
+    }
+
+    attempts.push({ profile: profile.id, status: r.status || 0 });
+
+    if (r.ok) return { response: r, profile, attempts };
+
+    try { await r.body?.cancel(); } catch {}
+
+    // En V002 no abortamos al primer 401/403/429:
+    // probamos el resto de perfiles porque algunos proveedores filtran por headers.
+    if (![401,403,404,405,429,500,502,503,504].includes(r.status)) {
+      return { response: r, profile, attempts };
+    }
+  }
+
+  return { response: null, profile: null, attempts };
 }
 
 function copyUpstreamHeaders(r, extra = {}) {
@@ -224,11 +296,12 @@ function pipeWebBody(r, res, extraHeaders = {}) {
   Readable.fromWeb(r.body).pipe(res);
 }
 
-function proxyToken(targetUrl, session) {
+function proxyToken(targetUrl, session, profileId = "") {
   return seal({
     url: targetUrl,
     u: session.u,
     p: session.p,
+    profileId,
     exp: Date.now() + 2 * 60 * 60 * 1000
   });
 }
@@ -239,7 +312,7 @@ function publicBase(req) {
   return `${proto}://${host}`;
 }
 
-function rewriteManifest(text, manifestUrl, req, session) {
+function rewriteManifest(text, manifestUrl, req, session, profileId = "") {
   const base = publicBase(req);
   const out = [];
 
@@ -249,7 +322,7 @@ function rewriteManifest(text, manifestUrl, req, session) {
       for (const m of matches) {
         const original = m[1];
         const abs = new URL(original, manifestUrl).toString();
-        const proxied = `${base}/segment?s=${encodeURIComponent(proxyToken(abs, session))}`;
+        const proxied = `${base}/segment?s=${encodeURIComponent(proxyToken(abs, session, profileId))}`;
         line = line.replace(`URI="${original}"`, `URI="${proxied}"`);
       }
       out.push(line);
@@ -262,7 +335,7 @@ function rewriteManifest(text, manifestUrl, req, session) {
     }
 
     const abs = new URL(line.trim(), manifestUrl).toString();
-    out.push(`${base}/segment?s=${encodeURIComponent(proxyToken(abs, session))}`);
+    out.push(`${base}/segment?s=${encodeURIComponent(proxyToken(abs, session, profileId))}`);
   }
   return out.join("\n");
 }
@@ -324,60 +397,58 @@ async function handleStream(req, res, url, kind, id) {
   if (kind === "live") mode = mode === "ts" ? "ts" : "hls";
 
   const candidates = streamCandidates(s, kind, id, ext, mode);
+  const allAttempts = [];
   let lastStatus = 502;
 
-  for (let i = 0; i < candidates.length; i++) {
-    const target = candidates[i];
-    let r;
-    try {
-      r = await proxyFetch(target, req);
-    } catch {
+  for (const target of candidates) {
+    const tried = await tryTargetProfiles(target, req);
+    allAttempts.push(...tried.attempts.map(a => ({ ...a, target })));
+
+    if (!tried.response || !tried.response.ok) {
+      const statuses = tried.attempts.map(a => a.status).filter(Boolean);
+      if (statuses.length) lastStatus = statuses[statuses.length - 1];
       continue;
     }
 
-    lastStatus = r.status || lastStatus;
-
-    if (!r.ok) {
-      try { await r.body?.cancel(); } catch {}
-      if ([401, 403, 429].includes(r.status)) {
-        return sendText(res, `No se pudo abrir el stream (${r.status})`, r.status, {
-          "X-Pixel-Stream-Mode": kind === "live" ? mode : safeExt(ext),
-          "X-Pixel-Upstream-Status": String(r.status)
-        });
-      }
-      if (![404, 405].includes(r.status) || i === candidates.length - 1) {
-        return sendText(res, `No se pudo abrir el stream (${r.status})`, r.status, {
-          "X-Pixel-Stream-Mode": kind === "live" ? mode : safeExt(ext),
-          "X-Pixel-Upstream-Status": String(r.status)
-        });
-      }
-      continue;
-    }
-
+    const r = tried.response;
+    const profile = tried.profile;
     const finalUrl = r.url || target;
     const ct = r.headers.get("content-type") || "";
 
     if (looksLikeManifest(ct, finalUrl)) {
       const manifest = await r.text();
       if (!manifest.trim().startsWith("#EXTM3U")) {
-        return sendText(res, "El proveedor no devolvió una lista HLS válida", 415);
+        lastStatus = 415;
+        continue;
       }
-      const rewritten = rewriteManifest(manifest, finalUrl, req, s);
+
+      const rewritten = rewriteManifest(manifest, finalUrl, req, s, profile?.id || "");
       return sendText(res, rewritten, 200, {
         "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
         "Cache-Control": "no-store",
-        "X-Pixel-Stream-Mode": "hls"
+        "X-Pixel-Stream-Mode": "hls",
+        "X-Pixel-Header-Profile": profile?.id || "",
+        "X-Pixel-Attempts": String(allAttempts.length)
       });
     }
 
     return pipeWebBody(r, res, {
       "X-Pixel-Stream-Mode": kind === "live" ? "ts" : safeExt(ext),
+      "X-Pixel-Header-Profile": profile?.id || "",
+      "X-Pixel-Attempts": String(allAttempts.length),
       ...(kind === "live" && !ct ? { "Content-Type": "video/mp2t" } : {})
     });
   }
 
-  return sendText(res, `No se pudo abrir el stream (${lastStatus})`, lastStatus, {
-    "X-Pixel-Stream-Mode": kind === "live" ? mode : safeExt(ext)
+  const seen = allAttempts
+    .map(a => `${a.profile}:${a.status || "ERR"}`)
+    .join(",");
+
+  return sendText(res, `No se pudo abrir el stream (${lastStatus})`, lastStatus || 502, {
+    "X-Pixel-Stream-Mode": kind === "live" ? mode : safeExt(ext),
+    "X-Pixel-Upstream-Status": String(lastStatus || 502),
+    "X-Pixel-Attempts": String(allAttempts.length),
+    "X-Pixel-Attempt-Summary": seen.slice(0, 500)
   });
 }
 
@@ -387,24 +458,36 @@ async function handleSegment(req, res, url) {
 
   if (!/^https?:$/.test(target.protocol)) return sendText(res, "Origen no permitido", 403);
 
-  const r = await proxyFetch(target.toString(), req);
-  if (!r.ok) return sendText(res, `Segmento no disponible (${r.status})`, r.status);
+  const tried = await tryTargetProfiles(target.toString(), req, payload.profileId || "");
+  const r = tried.response;
+
+  if (!r || !r.ok) {
+    const statuses = tried.attempts.map(a => a.status).filter(Boolean);
+    const status = statuses.length ? statuses[statuses.length - 1] : 502;
+    return sendText(res, `Segmento no disponible (${status})`, status, {
+      "X-Pixel-Attempts": String(tried.attempts.length)
+    });
+  }
 
   const finalUrl = r.url || target.toString();
   const ct = r.headers.get("content-type") || "";
+  const profileId = tried.profile?.id || payload.profileId || "";
 
   if (looksLikeManifest(ct, finalUrl)) {
     const manifest = await r.text();
     if (manifest.trim().startsWith("#EXTM3U")) {
-      const rewritten = rewriteManifest(manifest, finalUrl, req, payload);
+      const rewritten = rewriteManifest(manifest, finalUrl, req, payload, profileId);
       return sendText(res, rewritten, 200, {
         "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        "Cache-Control": "no-store"
+        "Cache-Control": "no-store",
+        "X-Pixel-Header-Profile": profileId
       });
     }
   }
 
-  return pipeWebBody(r, res);
+  return pipeWebBody(r, res, {
+    "X-Pixel-Header-Profile": profileId
+  });
 }
 
 async function handleImage(req, res, url) {
@@ -452,8 +535,11 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V001",
-        upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE)
+        version: "V002",
+        upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
+        alternateHeaderProfiles: true,
+        alternateStreamPaths: true,
+        playerRefererConfigured: !!PLAYER_REFERER
       });
     }
 
@@ -488,5 +574,5 @@ server.keepAliveTimeout = 70_000;
 server.headersTimeout = 75_000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V001 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V002 escuchando en 0.0.0.0:${PORT}`);
 });
