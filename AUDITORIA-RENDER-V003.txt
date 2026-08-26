@@ -1,0 +1,38 @@
+PIXEL IPTV V023 + RENDER V003 — VALIDACIÓN FINAL
+
+FRONTEND
+OK - app.js pasa node --check.
+OK - 112 IDs HTML revisados; no hay IDs duplicados.
+OK - selectores #id estáticos usados por app.js existen en index.html.
+OK - assets locales referenciados existen.
+OK - V023 referencia styles/app/config v23.
+OK - eliminada /api/probe-stream obsoleta.
+OK - V023 no inserta el token principal de sesión en URLs de reproducción.
+OK - reproducción usa tickets temporales.
+OK - favoritos/continuar viendo distinguen episodios de series.
+OK - protección contra respuestas viejas al cambiar rápido de contenido.
+OK - protección contra guardar progreso del video anterior en el nuevo.
+OK - hero y detalles mantienen estados separados.
+OK - recuperación de sesión inválida/vencida.
+
+BACKEND
+OK - server.js pasa node --check.
+OK - /health informa V003.
+OK - login genera sesión + token de imagen.
+OK - /api/image-token renueva token de imágenes.
+OK - /api/data validado con catálogo simulado.
+OK - /api/ticket genera ticket temporal de stream.
+OK - HLS manifest reescrito sin exponer credenciales.
+OK - segmentos HLS pasan por token de segmento.
+OK - reproducción directa MP4 probada con upstream simulado.
+OK - token inválido devuelve 401 (no 500).
+OK - JSON inválido devuelve 400.
+OK - IDs peligrosos son rechazados con 400.
+OK - timeouts, límites de login, validación de contenido y cierre ordenado incluidos.
+OK - proxy de imágenes bloquea hosts privados y revisa redirects.
+OK - redirects de stream se validan antes de seguirlos.
+
+NOTA
+Ninguna prueba local puede garantizar que un proveedor IPTV externo no devuelva 403,
+porque eso depende de sus reglas, IPs y disponibilidad. V003 sí valida que el proxy,
+tickets, HLS y rutas internas funcionen correctamente.

@@ -13,3 +13,7 @@ services:
         sync: false
       - key: ALLOWED_ORIGIN
         value: "*"
+      - key: PLAYER_REFERER
+        value: "https://nubweb.nubservices.com/"
+      - key: PLAYER_ORIGIN
+        value: "https://nubweb.nubservices.com"

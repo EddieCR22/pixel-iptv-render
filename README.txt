@@ -1,28 +1,28 @@
-PIXEL IPTV RENDER V002
+PIXEL IPTV RENDER V003
 
-CAMBIO PRINCIPAL
-V001 abortaba inmediatamente cuando la primera ruta devolvía 403.
-V002 prueba rutas alternativas Y varios perfiles de cabeceras antes de rendirse.
+Revisión integral del backend.
 
-ESTRATEGIAS
-- VLC
-- ExoPlayer
-- Navegador
-- Android TV
-- Rutas Xtream /live/... y /usuario/clave/...
-- Los segmentos HLS recuerdan el perfil que logró abrir el manifest.
+MEJORAS PRINCIPALES
+- Sesiones inválidas/vencidas devuelven 401 en vez de 500.
+- Tickets de reproducción de corta duración: el token general ya no necesita viajar en la URL del video.
+- Token separado para imágenes.
+- Compatibilidad temporal con frontend V022 durante el despliegue.
+- Rutas alternativas y perfiles VLC / ExoPlayer / navegador / Android TV.
+- Timeouts reales para API, streams e imágenes.
+- Manifests HLS validados y reescritos; sus segmentos heredan el perfil que funcionó.
+- Los tickets de segmentos duran como máximo lo que dura la sesión.
+- Se rechaza HTML cuando se esperaba video.
+- Protección adicional del proxy de imágenes contra hosts privados y redirects peligrosos.
+- Rate limit básico de login por IP.
+- IDs y extensiones validados.
+- Cierre de streams cuando el cliente abandona la reproducción.
+- Cierre ordenado SIGTERM/SIGINT para deploys de Render.
 
-VARIABLES EXISTENTES
+VARIABLES REQUERIDAS
 UPSTREAM_BASE
-TOKEN_SECRET
+TOKEN_SECRET (32+ caracteres)
 ALLOWED_ORIGIN
 
-NUEVAS VARIABLES OPCIONALES
+OPCIONALES
 PLAYER_REFERER=https://nubweb.nubservices.com/
 PLAYER_ORIGIN=https://nubweb.nubservices.com
-
-Si no las agregas, V002 ya usa esos valores como predeterminados.
-
-IMPORTANTE
-Si después de todas las rutas/perfiles el upstream sigue devolviendo 403,
-el proveedor probablemente está bloqueando la IP/datacenter de Render.
