@@ -47,6 +47,7 @@ function corsHeaders(extra = {}) {
 }
 
 function sendJson(res, data, status = 200, headers = {}) {
+  if (res.destroyed || res.writableEnded) return;
   const body = Buffer.from(JSON.stringify(data));
   res.writeHead(status, corsHeaders({
     "Content-Type": "application/json; charset=utf-8",
@@ -58,6 +59,7 @@ function sendJson(res, data, status = 200, headers = {}) {
 }
 
 function sendText(res, text, status = 200, headers = {}) {
+  if (res.destroyed || res.writableEnded) return;
   const body = Buffer.from(String(text));
   res.writeHead(status, corsHeaders({
     "Content-Type": "text/plain; charset=utf-8",
@@ -209,6 +211,20 @@ function safeExt(v, fallback = "mp4") {
   const x = String(v || fallback).replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
   return x || fallback;
 }
+
+function mediaTypeForExt(ext) {
+  const x = safeExt(ext, "mp4");
+  if (x === "mp4" || x === "m4v") return "video/mp4";
+  if (x === "webm") return "video/webm";
+  if (x === "m3u8") return "application/vnd.apple.mpegurl";
+  if (["ts","mpegts","m2ts"].includes(x)) return "video/mp2t";
+  if (x === "mov") return "video/quicktime";
+  return "application/octet-stream";
+}
+function usableMediaContentType(ct) {
+  const x = String(ct || "").toLowerCase().split(";")[0].trim();
+  return x && !["application/octet-stream","binary/octet-stream","application/download"].includes(x);
+}
 function safeId(v) {
   const x = String(v ?? "").trim();
   if (!x || x.length > 128 || !/^[A-Za-z0-9._-]+$/.test(x)) throw new HttpError(400, "ID de contenido inválido");
@@ -238,7 +254,28 @@ function streamCandidates(session, kind, id, ext, mode) {
       `${UPSTREAM_BASE}/${u}/${p}/${sid}`
     ];
   }
-  return [`${UPSTREAM_BASE}/${kind}/${u}/${p}/${sid}.${safeExt(ext, "mp4")}`];
+
+  const prefix = `${UPSTREAM_BASE}/${kind}/${u}/${p}/${sid}`;
+  if (mode === "hls") {
+    return [
+      `${prefix}.m3u8`,
+      `${UPSTREAM_BASE}/${u}/${p}/${sid}.m3u8`
+    ];
+  }
+  if (mode === "ts") {
+    return [
+      `${prefix}.ts`,
+      `${UPSTREAM_BASE}/${u}/${p}/${sid}.ts`
+    ];
+  }
+  if (mode === "mp4") {
+    return [`${prefix}.mp4`];
+  }
+
+  const original = safeExt(ext, "mp4");
+  const out = [`${prefix}.${original}`];
+  if (original !== "mp4") out.push(`${prefix}.mp4`);
+  return out;
 }
 
 function looksLikeManifest(ct, url) {
@@ -344,15 +381,30 @@ function copyUpstreamHeaders(r, extra = {}) {
   return { ...h, ...extra };
 }
 function pipeWebBody(r, res, extraHeaders = {}) {
+  if (res.destroyed || res.writableEnded) return;
   res.writeHead(r.status, copyUpstreamHeaders(r, extraHeaders));
   if (!r.body) return res.end();
+
   const body = Readable.fromWeb(r.body);
+  let finished = false;
+
   const close = () => {
-    try { body.destroy(); } catch {}
-    try { r.body?.cancel(); } catch {}
+    if (finished) return;
+    finished = true;
+    try { if (!body.destroyed) body.destroy(); } catch {}
   };
+
   reqCloseGuard(res, close);
-  body.on("error", () => { if (!res.destroyed) res.destroy(); });
+  body.once("end", () => { finished = true; });
+  body.once("close", () => { finished = true; });
+  body.on("error", err => {
+    finished = true;
+    if (err?.name !== "AbortError" && err?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
+      console.warn("Stream upstream cerrado:", err?.message || err);
+    }
+    if (!res.destroyed) res.destroy();
+  });
+  res.on("error", close);
   body.pipe(res);
 }
 function reqCloseGuard(res, fn) {
@@ -512,7 +564,10 @@ async function handleTicket(req, res, url) {
   const kind = safeKind(body.kind);
   const id = safeId(body.id);
   const ext = safeExt(body.ext || "mp4");
-  const mode = kind === "live" && body.mode === "ts" ? "ts" : kind === "live" ? "hls" : "";
+  const requestedMode = String(body.mode || "").toLowerCase();
+  const mode = kind === "live"
+    ? (requestedMode === "ts" ? "ts" : "hls")
+    : (["hls","ts","mp4"].includes(requestedMode) ? requestedMode : "direct");
   const exp = Math.min(Number(s.exp || 0), Date.now() + STREAM_TICKET_MS);
   const ticket = seal({ scope: "stream", u: s.u, p: s.p, kind, id, ext, mode, sessionExp: s.exp, exp });
   return sendJson(res, { ticket, expires: exp });
@@ -535,8 +590,9 @@ async function handleStream(req, res, url, kind, id) {
   kind = safeKind(kind); id = safeId(id);
   const s = streamSessionFromUrl(url, kind, id);
   let ext = safeExt(url.searchParams.get("ext") || s.ext || "mp4");
-  let mode = String(url.searchParams.get("mode") || s.mode || "");
+  let mode = String(url.searchParams.get("mode") || s.mode || "").toLowerCase();
   if (kind === "live") mode = mode === "ts" ? "ts" : "hls";
+  else mode = ["hls","ts","mp4"].includes(mode) ? mode : "direct";
 
   const candidates = streamCandidates(s, kind, id, ext, mode);
   const allAttempts = [];
@@ -567,17 +623,32 @@ async function handleStream(req, res, url, kind, id) {
       });
     }
 
+    // Si pedimos HLS para compatibilidad y el proveedor devolvió un archivo
+    // normal, no se lo entregamos a hls.js como si fuera un manifest.
+    if (kind !== "live" && mode === "hls") {
+      lastStatus = 415;
+      try { await r.body?.cancel(); } catch {}
+      continue;
+    }
+
     if (looksLikeHtml(ct)) {
       lastStatus = 415;
       try { await r.body?.cancel(); } catch {}
       continue;
     }
 
+    const fallbackType = kind === "live"
+      ? "video/mp2t"
+      : mode === "ts"
+        ? "video/mp2t"
+        : mediaTypeForExt(mode === "mp4" ? "mp4" : ext);
+
     return pipeWebBody(r, res, {
-      "X-Pixel-Stream-Mode": kind === "live" ? "ts" : safeExt(ext),
+      "Content-Type": usableMediaContentType(ct) ? ct : fallbackType,
+      "Content-Disposition": "inline",
+      "X-Pixel-Stream-Mode": kind === "live" ? "ts" : mode,
       "X-Pixel-Header-Profile": profile?.id || "",
-      "X-Pixel-Attempts": String(allAttempts.length),
-      ...(kind === "live" && !ct ? { "Content-Type": "video/mp2t" } : {})
+      "X-Pixel-Attempts": String(allAttempts.length)
     });
   }
 
@@ -673,13 +744,16 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V003",
+        version: "V004",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
         scopedStreamTickets: true,
         scopedImageTokens: true,
         upstreamTimeouts: true,
+        vodCompatibilityFallbacks: true,
+        normalizedMediaTypes: true,
+        safeStreamShutdown: true,
         playerRefererConfigured: !!PLAYER_REFERER
       });
     }
@@ -714,15 +788,22 @@ server.keepAliveTimeout = 70_000;
 server.headersTimeout = 75_000;
 server.requestTimeout = 0;
 server.maxRequestsPerSocket = 1000;
+server.on("clientError", (err, socket) => {
+  if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+});
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V003 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V004 cerrando por ${signal}`);
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 10_000).unref();
+  setTimeout(() => {
+    try { server.closeIdleConnections?.(); } catch {}
+    try { server.closeAllConnections?.(); } catch {}
+    process.exit(0);
+  }, 8_000).unref();
 }
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V003 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V004 escuchando en 0.0.0.0:${PORT}`);
 });

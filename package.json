@@ -1,9 +1,14 @@
 {
   "name": "pixel-iptv-render-proxy",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
   "description": "Proxy HTTPS seguro y robusto para Pixel IPTV",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "check": "node --check server.js" },
-  "engines": { "node": ">=20" }
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }
