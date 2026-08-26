@@ -1,0 +1,13 @@
+{
+  "name": "pixel-iptv-render-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Proxy HTTPS para Pixel IPTV",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

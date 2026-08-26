@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: pixel-iptv-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: UPSTREAM_BASE
+        sync: false
+      - key: TOKEN_SECRET
+        sync: false
+      - key: ALLOWED_ORIGIN
+        value: "*"
