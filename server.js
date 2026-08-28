@@ -17,12 +17,12 @@ const PLAYER_REFERER = String(process.env.PLAYER_REFERER || "https://nubweb.nubs
 const PLAYER_ORIGIN = String(process.env.PLAYER_ORIGIN || "https://nubweb.nubservices.com");
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const STREAM_TICKET_MS = 10 * 60 * 1000;
-const UPSTREAM_JSON_TIMEOUT_MS = 15_000;
+const UPSTREAM_JSON_TIMEOUT_MS = 25_000;
 const UPSTREAM_STREAM_TIMEOUT_MS = 18_000;
 const IMAGE_TIMEOUT_MS = 12_000;
 const MAX_JSON_BODY = 256 * 1024;
 const AUDIO_FIX_START_TIMEOUT_MS = 25_000;
-const AUDIO_FIX_PROXY_UA = "Pixel-IPTV-AudioFix-V009";
+const AUDIO_FIX_PROXY_UA = "Pixel-IPTV-AudioFix-V010";
 const MAX_ACTIVE_TRANSCODES = Math.max(1, Math.min(4, Number(process.env.MAX_ACTIVE_TRANSCODES || 2)));
 
 const loginBuckets = new Map();
@@ -567,6 +567,9 @@ async function handleData(req, res, url) {
   const extra = {};
   if (action === "get_vod_info") extra.vod_id = safeId(body.vod_id);
   if (action === "get_series_info") extra.series_id = safeId(body.series_id);
+  if (["get_live_streams","get_vod_streams","get_series"].includes(action) && body.category_id != null && String(body.category_id).trim()) {
+    extra.category_id = safeId(body.category_id);
+  }
   if (action === "get_short_epg") {
     extra.stream_id = safeId(body.stream_id);
     extra.limit = Math.max(1, Math.min(20, Number(body.limit || 5)));
@@ -647,12 +650,12 @@ async function handleLiveAudioFix(req, res, session, id) {
   // cuando FFmpeg intentaba abrir el proveedor por su cuenta.
   const inputUrl = buildAudioFixInputUrl(req, session, id);
   const args = [
-    "-nostdin", "-hide_banner", "-loglevel", "warning",
+    "-nostdin", "-hide_banner", "-loglevel", "info",
     "-rw_timeout", "15000000",
     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
     "-user_agent", AUDIO_FIX_PROXY_UA,
     "-i", inputUrl,
-    "-map", "0:v:0?", "-map", "0:a:0?",
+    "-map", "0:v:0?", "-map", "0:a:0",
     "-c:v", "copy",
     "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
     "-af", "aresample=async=1:first_pts=0",
@@ -898,7 +901,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V009",
+        version: "V010",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -914,6 +917,9 @@ async function route(req, res) {
         audioFixLoopback: true,
         audioFixDiagnostics: true,
         audioFixLoopbackSchemeFix: true,
+        categoryScopedCatalog: true,
+        catalogJsonTimeoutMs: UPSTREAM_JSON_TIMEOUT_MS,
+        audioInputRequired: true,
         ffmpegConfigured: !!ffmpegPath,
         activeTranscodes,
         maxActiveTranscodes: MAX_ACTIVE_TRANSCODES
@@ -955,7 +961,7 @@ server.on("clientError", (err, socket) => {
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V008 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V010 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -967,5 +973,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V008 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V010 escuchando en 0.0.0.0:${PORT}`);
 });
