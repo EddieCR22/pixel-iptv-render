@@ -10,7 +10,7 @@ const PORT = Number(process.env.PORT || 10000);
 const UPSTREAM_BASE = String(process.env.UPSTREAM_BASE || "").replace(/\/+$/g, "");
 const UPSTREAM_HOST = (() => { try { return new URL(UPSTREAM_BASE).hostname.toLowerCase(); } catch { return ""; } })();
 const TOKEN_SECRET = String(process.env.TOKEN_SECRET || "");
-const ALLOWED_ORIGIN = String(process.env.ALLOWED_ORIGIN || "*");
+const ALLOWED_ORIGIN = String(process.env.ALLOWED_ORIGIN || "https://iptv.pixelservicecr.com").replace(/\/+$/g, "");
 const PLAYER_REFERER = String(process.env.PLAYER_REFERER || "https://nubweb.nubservices.com/");
 const PLAYER_ORIGIN = String(process.env.PLAYER_ORIGIN || "https://nubweb.nubservices.com");
 const SESSION_MS = 8 * 60 * 60 * 1000;
@@ -40,6 +40,11 @@ function corsHeaders(extra = {}) {
       "X-Pixel-Attempts"
     ].join(", "),
     "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "X-Permitted-Cross-Domain-Policies": "none",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     ...extra
   };
   if (ALLOWED_ORIGIN !== "*") h.Vary = "Origin";
@@ -72,6 +77,7 @@ function sendText(res, text, status = 200, headers = {}) {
 function requireConfig() {
   if (!/^https?:\/\//i.test(UPSTREAM_BASE)) throw new HttpError(503, "UPSTREAM_BASE no configurado");
   if (TOKEN_SECRET.length < 32) throw new HttpError(503, "TOKEN_SECRET debe tener al menos 32 caracteres");
+  if (!/^https:\/\//i.test(ALLOWED_ORIGIN) || ALLOWED_ORIGIN === "*") throw new HttpError(503, "ALLOWED_ORIGIN debe ser el dominio HTTPS exacto de Pixel IPTV");
 }
 
 function b64url(buf) {
@@ -506,7 +512,7 @@ function checkLoginRateLimit(req) {
   if (now - item.start > win) { item.start = now; item.count = 0; }
   item.count++;
   loginBuckets.set(key, item);
-  if (item.count > 25) throw new HttpError(429, "Demasiados intentos de acceso. Intenta de nuevo en unos minutos.");
+  if (item.count > 12) throw new HttpError(429, "Demasiados intentos de acceso. Intenta de nuevo en unos minutos.");
   if (loginBuckets.size > 5000) {
     for (const [k, v] of loginBuckets) if (now - v.start > win) loginBuckets.delete(k);
   }
@@ -744,7 +750,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V004",
+        version: "V005",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -786,14 +792,14 @@ const server = http.createServer((req, res) => {
 
 server.keepAliveTimeout = 70_000;
 server.headersTimeout = 75_000;
-server.requestTimeout = 0;
+server.requestTimeout = 30_000;
 server.maxRequestsPerSocket = 1000;
 server.on("clientError", (err, socket) => {
   if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V004 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V005 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -805,5 +811,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V004 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V005 escuchando en 0.0.0.0:${PORT}`);
 });

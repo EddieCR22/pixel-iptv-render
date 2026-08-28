@@ -12,7 +12,7 @@ services:
       - key: TOKEN_SECRET
         sync: false
       - key: ALLOWED_ORIGIN
-        value: "*"
+        value: "https://iptv.pixelservicecr.com"
       - key: PLAYER_REFERER
         value: "https://nubweb.nubservices.com/"
       - key: PLAYER_ORIGIN
