@@ -2,8 +2,6 @@
 
 const http = require("http");
 const { Readable } = require("stream");
-const { spawn } = require("child_process");
-const ffmpegPath = require("ffmpeg-static");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
@@ -17,16 +15,12 @@ const PLAYER_REFERER = String(process.env.PLAYER_REFERER || "https://nubweb.nubs
 const PLAYER_ORIGIN = String(process.env.PLAYER_ORIGIN || "https://nubweb.nubservices.com");
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const STREAM_TICKET_MS = 10 * 60 * 1000;
-const UPSTREAM_JSON_TIMEOUT_MS = 25_000;
+const UPSTREAM_JSON_TIMEOUT_MS = 15_000;
 const UPSTREAM_STREAM_TIMEOUT_MS = 18_000;
 const IMAGE_TIMEOUT_MS = 12_000;
 const MAX_JSON_BODY = 256 * 1024;
-const AUDIO_FIX_START_TIMEOUT_MS = 25_000;
-const AUDIO_FIX_PROXY_UA = "Pixel-IPTV-AudioFix-V011";
-const MAX_ACTIVE_TRANSCODES = Math.max(1, Math.min(4, Number(process.env.MAX_ACTIVE_TRANSCODES || 2)));
 
 const loginBuckets = new Map();
-let activeTranscodes = 0;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -433,19 +427,8 @@ function proxyToken(targetUrl, session, profileId = "") {
   });
 }
 function publicBase(req) {
-  const host = String(req.headers.host || "").trim();
-  const hostname = host.replace(/^\[/, "").replace(/\].*$/, "").split(":")[0].toLowerCase();
-  const remote = String(req.socket?.remoteAddress || "").replace(/^::ffff:/, "").toLowerCase();
-  const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" ||
-    remote === "127.0.0.1" || remote === "::1";
-
-  // V009: las playlists solicitadas por FFmpeg mediante loopback deben reescribir
-  // también sus segmentos a HTTP loopback. Si no, el valor por defecto HTTPS
-  // hace que FFmpeg intente TLS contra el servidor HTTP interno de Node y falle
-  // con "An unexpected TLS packet was received".
-  const proto = loopback
-    ? "http"
-    : String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+  const proto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+  const host = req.headers.host;
   return `${proto}://${host}`;
 }
 function rewriteManifest(text, manifestUrl, req, session, profileId = "") {
@@ -567,9 +550,6 @@ async function handleData(req, res, url) {
   const extra = {};
   if (action === "get_vod_info") extra.vod_id = safeId(body.vod_id);
   if (action === "get_series_info") extra.series_id = safeId(body.series_id);
-  if (["get_live_streams","get_vod_streams","get_series"].includes(action) && body.category_id != null && String(body.category_id).trim()) {
-    extra.category_id = safeId(body.category_id);
-  }
   if (action === "get_short_epg") {
     extra.stream_id = safeId(body.stream_id);
     extra.limit = Math.max(1, Math.min(20, Number(body.limit || 5)));
@@ -592,7 +572,7 @@ async function handleTicket(req, res, url) {
   const ext = safeExt(body.ext || "mp4");
   const requestedMode = String(body.mode || "").toLowerCase();
   const mode = kind === "live"
-    ? (["ts","audiofix"].includes(requestedMode) ? requestedMode : "hls")
+    ? (requestedMode === "ts" ? "ts" : "hls")
     : (["hls","ts","mp4"].includes(requestedMode) ? requestedMode : "direct");
   const exp = Math.min(Number(s.exp || 0), Date.now() + STREAM_TICKET_MS);
   const ticket = seal({ scope: "stream", u: s.u, p: s.p, kind, id, ext, mode, sessionExp: s.exp, exp });
@@ -612,190 +592,13 @@ function streamSessionFromUrl(url, kind, id) {
   throw new HttpError(401, "Falta autorización de reproducción");
 }
 
-
-function buildAudioFixInputUrl(session, id, sourceMode = "ts") {
-  const mode = sourceMode === "hls" ? "hls" : "ts";
-  const exp = Math.min(
-    Number(session.sessionExp || session.exp || 0) || (Date.now() + STREAM_TICKET_MS),
-    Date.now() + STREAM_TICKET_MS
-  );
-  const ticket = seal({
-    scope: "stream",
-    u: session.u, p: session.p, kind: "live", id: String(id),
-    ext: mode === "hls" ? "m3u8" : "ts", mode,
-    sessionExp: session.sessionExp || session.exp, exp
-  });
-  return `http://127.0.0.1:${PORT}/stream/live/${encodeURIComponent(id)}?mode=${mode}&ticket=${encodeURIComponent(ticket)}`;
-}
-
-function sanitizeAudioFixLog(text) {
-  return String(text || "")
-    .replace(/ticket=[^&\s]+/gi, "ticket=[redacted]")
-    .replace(/token=[^&\s]+/gi, "token=[redacted]")
-    .replace(/https?:\/\/[^\s]+/gi, "[url]")
-    .slice(-1800);
-}
-
-function audioFixArgs(inputUrl) {
-  return [
-    "-nostdin", "-hide_banner", "-loglevel", "info",
-    "-rw_timeout", "15000000",
-    "-probesize", "8000000", "-analyzeduration", "8000000",
-    "-fflags", "+genpts+discardcorrupt",
-    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-    "-user_agent", AUDIO_FIX_PROXY_UA,
-    "-i", inputUrl,
-    // Para declarar éxito deben existir VIDEO y AUDIO. No se acepta video silencioso.
-    "-map", "0:v:0", "-map", "0:a:0",
-    "-c:v", "copy",
-    "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000",
-    "-af", "aresample=async=1:first_pts=0",
-    "-avoid_negative_ts", "make_zero",
-    "-mpegts_flags", "+resend_headers",
-    "-muxdelay", "0", "-muxpreload", "0",
-    "-f", "mpegts", "pipe:1"
-  ];
-}
-
-function handleLiveAudioFix(req, res, session, id) {
-  if (!ffmpegPath) throw new HttpError(503, "FFmpeg no está disponible en el servidor");
-  if (activeTranscodes >= MAX_ACTIVE_TRANSCODES) {
-    throw new HttpError(429, "La corrección automática de audio está ocupada. Intenta de nuevo en unos segundos.");
-  }
-
-  // V011: el HLS de algunos proveedores contiene video pero pierde/omite la pista
-  // de audio. Por eso se intenta primero el transporte MPEG-TS original, que suele
-  // conservar AC3/EAC3/AAC, y FFmpeg convierte SOLO el audio a AAC. Si el TS no
-  // existe o no trae audio, se prueba el HLS proxificado como segunda fuente.
-  const sources = ["ts", "hls"];
-  let sourceIndex = 0;
-  let currentProc = null;
-  let cancelled = false;
-  let responseStarted = false;
-  let released = false;
-  const attemptLogs = [];
-
-  activeTranscodes++;
-  console.log(`[audiofix] start id=${String(id)} sources=ts,hls active=${activeTranscodes}/${MAX_ACTIVE_TRANSCODES}`);
-
-  const release = () => {
-    if (released) return;
-    released = true;
-    activeTranscodes = Math.max(0, activeTranscodes - 1);
-  };
-  const killCurrent = () => {
-    try { if (currentProc && !currentProc.killed) currentProc.kill("SIGKILL"); } catch {}
-  };
-  const failCompletely = () => {
-    if (cancelled || responseStarted) return;
-    release();
-    const detail = attemptLogs.filter(Boolean).join(" || ").slice(-1200);
-    console.warn(`[audiofix] failed id=${String(id)} attempts=${sources.join(",")} log=${sanitizeAudioFixLog(detail)}`);
-    if (!res.headersSent && !res.destroyed && !res.writableEnded) {
-      sendText(res,
-        "El origen no entregó una pista de audio utilizable ni por MPEG-TS ni por HLS.",
-        502,
-        {"X-Pixel-Stream-Mode":"audiofix", "X-Pixel-Audio-Fix":"failed"}
-      );
-    }
-  };
-
-  reqCloseGuard(res, () => {
-    cancelled = true;
-    killCurrent();
-    release();
-  });
-
-  const startAttempt = () => {
-    if (cancelled || responseStarted) return;
-    if (sourceIndex >= sources.length) return failCompletely();
-
-    const sourceMode = sources[sourceIndex++];
-    const inputUrl = buildAudioFixInputUrl(session, id, sourceMode);
-    const proc = spawn(ffmpegPath, audioFixArgs(inputUrl), { stdio: ["ignore", "pipe", "pipe"] });
-    currentProc = proc;
-    let stderr = "";
-    let committed = false;
-    let advanced = false;
-    const timeoutMs = sourceMode === "ts" ? 20_000 : AUDIO_FIX_START_TIMEOUT_MS;
-
-    console.log(`[audiofix] attempt id=${String(id)} source=${sourceMode}`);
-
-    const advance = reason => {
-      if (advanced || committed || cancelled || responseStarted) return;
-      advanced = true;
-      clearTimeout(timer);
-      const log = sanitizeAudioFixLog(stderr);
-      attemptLogs.push(`${sourceMode}:${reason}${log ? `:${log}` : ""}`);
-      console.warn(`[audiofix] retry id=${String(id)} source=${sourceMode} reason=${reason} log=${log}`);
-      try { if (!proc.killed) proc.kill("SIGKILL"); } catch {}
-      setImmediate(startAttempt);
-    };
-
-    const timer = setTimeout(() => advance("startup-timeout"), timeoutMs);
-
-    proc.stderr.on("data", chunk => {
-      if (stderr.length < 12000) stderr += chunk.toString("utf8").slice(0, 12000 - stderr.length);
-    });
-
-    proc.stdout.once("data", first => {
-      if (advanced || cancelled || res.destroyed || res.writableEnded) {
-        try { if (!proc.killed) proc.kill("SIGKILL"); } catch {}
-        return;
-      }
-      committed = true;
-      responseStarted = true;
-      clearTimeout(timer);
-      const audioDetected = /Audio:/i.test(stderr);
-      console.log(`[audiofix] output id=${String(id)} source=${sourceMode} audioDetected=${audioDetected} log=${sanitizeAudioFixLog(stderr)}`);
-      res.writeHead(200, corsHeaders({
-        "Content-Type": "video/mp2t",
-        "Cache-Control": "no-store",
-        "X-Pixel-Stream-Mode": "audiofix",
-        "X-Pixel-Audio-Fix": "aac",
-        "X-Pixel-Audio-Source": sourceMode
-      }));
-      res.write(first);
-      proc.stdout.pipe(res);
-    });
-
-    proc.on("error", err => {
-      if (committed) {
-        console.error(`[audiofix] stream-error id=${String(id)} source=${sourceMode} ${err?.message || err}`);
-        release();
-        if (!res.destroyed) res.destroy();
-        return;
-      }
-      advance(`spawn-error:${err?.message || err}`);
-    });
-
-    proc.on("close", code => {
-      clearTimeout(timer);
-      if (advanced || cancelled) return;
-      if (committed) {
-        console.log(`[audiofix] close id=${String(id)} source=${sourceMode} code=${code ?? "?"} log=${sanitizeAudioFixLog(stderr)}`);
-        release();
-        if (!res.destroyed && !res.writableEnded) res.end();
-        return;
-      }
-      advance(`exit-${code ?? "?"}`);
-    });
-  };
-
-  startAttempt();
-}
-
 async function handleStream(req, res, url, kind, id) {
   kind = safeKind(kind); id = safeId(id);
   const s = streamSessionFromUrl(url, kind, id);
   let ext = safeExt(url.searchParams.get("ext") || s.ext || "mp4");
   let mode = String(url.searchParams.get("mode") || s.mode || "").toLowerCase();
-  if (kind === "live") mode = ["ts","audiofix"].includes(mode) ? mode : "hls";
+  if (kind === "live") mode = mode === "ts" ? "ts" : "hls";
   else mode = ["hls","ts","mp4"].includes(mode) ? mode : "direct";
-
-  if (kind === "live" && mode === "audiofix") {
-    return await handleLiveAudioFix(req, res, s, id);
-  }
 
   const candidates = streamCandidates(s, kind, id, ext, mode);
   const allAttempts = [];
@@ -947,7 +750,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V011",
+        version: "V005",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -957,20 +760,7 @@ async function route(req, res) {
         vodCompatibilityFallbacks: true,
         normalizedMediaTypes: true,
         safeStreamShutdown: true,
-        playerRefererConfigured: !!PLAYER_REFERER,
-        audioTranscodeFallback: true,
-        proxiedHlsAudioSource: true,
-        audioFixLoopback: true,
-        audioFixDiagnostics: true,
-        audioFixLoopbackSchemeFix: true,
-        categoryScopedCatalog: true,
-        catalogJsonTimeoutMs: UPSTREAM_JSON_TIMEOUT_MS,
-        audioInputRequired: true,
-        audioFixTsFirst: true,
-        audioFixSourceFallback: "ts->hls",
-        ffmpegConfigured: !!ffmpegPath,
-        activeTranscodes,
-        maxActiveTranscodes: MAX_ACTIVE_TRANSCODES
+        playerRefererConfigured: !!PLAYER_REFERER
       });
     }
 
@@ -1009,7 +799,7 @@ server.on("clientError", (err, socket) => {
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V011 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V005 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -1021,5 +811,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V010 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V005 escuchando en 0.0.0.0:${PORT}`);
 });
