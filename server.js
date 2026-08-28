@@ -22,6 +22,7 @@ const UPSTREAM_STREAM_TIMEOUT_MS = 18_000;
 const IMAGE_TIMEOUT_MS = 12_000;
 const MAX_JSON_BODY = 256 * 1024;
 const AUDIO_FIX_START_TIMEOUT_MS = 25_000;
+const AUDIO_FIX_PROXY_UA = "Pixel-IPTV-AudioFix-V007";
 const MAX_ACTIVE_TRANSCODES = Math.max(1, Math.min(4, Number(process.env.MAX_ACTIVE_TRANSCODES || 2)));
 
 const loginBuckets = new Map();
@@ -598,58 +599,37 @@ function streamSessionFromUrl(url, kind, id) {
 }
 
 
-async function resolveLiveHlsInput(session, id, req) {
-  const candidates = streamCandidates(session, "live", id, "m3u8", "hls");
-  const attempts = [];
-  let lastStatus = 502;
-
-  for (const target of candidates) {
-    const tried = await tryTargetProfiles(target, req);
-    attempts.push(...tried.attempts.map(a => ({ ...a, target })));
-    if (!tried.response || !tried.response.ok) {
-      const statuses = tried.attempts.map(a => a.status).filter(Boolean);
-      if (statuses.length) lastStatus = statuses[statuses.length - 1];
-      continue;
-    }
-    const r = tried.response;
-    const finalUrl = r.url || target;
-    const ct = r.headers.get("content-type") || "";
-    const profile = tried.profile || profileById("vlc");
-    const isManifest = looksLikeManifest(ct, finalUrl);
-    try { await r.body?.cancel(); } catch {}
-    if (isManifest) return { url: finalUrl, profile, attempts };
-    lastStatus = 415;
-  }
-
-  const seen = attempts.map(a => `${a.profile}:${a.status || "ERR"}`).join(",");
-  const err = new HttpError(lastStatus || 502, "No se pudo abrir la fuente HLS para corregir el audio");
-  err.attemptSummary = seen.slice(0, 500);
-  throw err;
-}
-
-function ffmpegHeaderBlock(profile) {
-  const lines = [];
-  if (profile?.referer) lines.push(`Referer: ${profile.referer}`);
-  if (profile?.origin) lines.push(`Origin: ${profile.origin}`);
-  lines.push("Accept-Language: es-419,es;q=0.9,en;q=0.7");
-  return lines.join("\r\n") + "\r\n";
+function buildAudioFixInputUrl(req, session, id) {
+  const exp = Math.min(
+    Number(session.sessionExp || session.exp || 0) || (Date.now() + STREAM_TICKET_MS),
+    Date.now() + STREAM_TICKET_MS
+  );
+  const ticket = seal({
+    scope: "stream",
+    u: session.u, p: session.p, kind: "live", id: String(id),
+    ext: "m3u8", mode: "hls", sessionExp: session.sessionExp || session.exp, exp
+  });
+  return `${publicBase(req)}/stream/live/${encodeURIComponent(id)}?mode=hls&ticket=${encodeURIComponent(ticket)}`;
 }
 
 async function handleLiveAudioFix(req, res, session, id) {
   if (!ffmpegPath) throw new HttpError(503, "FFmpeg no está disponible en el servidor");
   if (activeTranscodes >= MAX_ACTIVE_TRANSCODES) {
-    throw new HttpError(429, "El modo de corrección de audio está ocupado. Intenta de nuevo en unos segundos.");
+    throw new HttpError(429, "La corrección automática de audio está ocupada. Intenta de nuevo en unos segundos.");
   }
 
-  const resolved = await resolveLiveHlsInput(session, id, req);
-  const profile = resolved.profile || profileById("vlc");
+  // V007: FFmpeg NO vuelve a entrar directamente al proveedor.
+  // Lee el HLS ya validado/re-escrito por este mismo proxy, de modo que
+  // cada playlist/segmento usa exactamente los perfiles de cabecera que
+  // ya funcionan en el reproductor web. Esto evita los 403 observados
+  // cuando FFmpeg intentaba abrir el proveedor por su cuenta.
+  const inputUrl = buildAudioFixInputUrl(req, session, id);
   const args = [
     "-nostdin", "-hide_banner", "-loglevel", "warning",
     "-rw_timeout", "15000000",
     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
-    "-user_agent", profile.ua || "VLC/3.0.21 LibVLC/3.0.21",
-    "-headers", ffmpegHeaderBlock(profile),
-    "-i", resolved.url,
+    "-user_agent", AUDIO_FIX_PROXY_UA,
+    "-i", inputUrl,
     "-map", "0:v:0?", "-map", "0:a:0?",
     "-c:v", "copy",
     "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
@@ -677,7 +657,7 @@ async function handleLiveAudioFix(req, res, session, id) {
     kill();
     release();
     if (!res.headersSent && !res.destroyed && !res.writableEnded) {
-      sendText(res, "La corrección de audio tardó demasiado en iniciar", 504, {
+      sendText(res, "La corrección automática de audio tardó demasiado en iniciar", 504, {
         "X-Pixel-Stream-Mode": "audiofix"
       });
     }
@@ -698,8 +678,7 @@ async function handleLiveAudioFix(req, res, session, id) {
       "Cache-Control": "no-store",
       "X-Pixel-Stream-Mode": "audiofix",
       "X-Pixel-Audio-Fix": "aac",
-      "X-Pixel-Header-Profile": profile.id || "",
-      "X-Pixel-Attempts": String(resolved.attempts.length)
+      "X-Pixel-Audio-Source": "proxied-hls"
     }));
     res.write(first);
     proc.stdout.pipe(res);
@@ -709,7 +688,7 @@ async function handleLiveAudioFix(req, res, session, id) {
     clearTimeout(startTimer);
     release();
     if (!headersSent && !res.headersSent && !res.destroyed && !res.writableEnded) {
-      sendText(res, `No se pudo iniciar la corrección de audio: ${err.message}`, 502, {"X-Pixel-Stream-Mode":"audiofix"});
+      sendText(res, `No se pudo iniciar la corrección automática de audio: ${err.message}`, 502, {"X-Pixel-Stream-Mode":"audiofix"});
     } else if (!res.destroyed) res.destroy();
   });
 
@@ -718,7 +697,7 @@ async function handleLiveAudioFix(req, res, session, id) {
     release();
     if (!headersSent) {
       if (!res.headersSent && !res.destroyed && !res.writableEnded) {
-        const detail = stderr.trim().split(/\r?\n/).slice(-2).join(" | ").slice(0, 500);
+        const detail = stderr.trim().split(/\r?\n/).slice(-3).join(" | ").slice(0, 700);
         sendText(res, detail ? `No se pudo corregir el audio: ${detail}` : `FFmpeg terminó sin entregar video (${code ?? "?"})`, 502, {
           "X-Pixel-Stream-Mode":"audiofix"
         });
@@ -891,7 +870,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V006",
+        version: "V007",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -903,6 +882,7 @@ async function route(req, res) {
         safeStreamShutdown: true,
         playerRefererConfigured: !!PLAYER_REFERER,
         audioTranscodeFallback: true,
+        proxiedHlsAudioSource: true,
         ffmpegConfigured: !!ffmpegPath,
         activeTranscodes,
         maxActiveTranscodes: MAX_ACTIVE_TRANSCODES
