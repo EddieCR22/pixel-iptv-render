@@ -1,8 +1,8 @@
 {
   "name": "pixel-iptv-render-proxy",
-  "version": "10.0.0",
+  "version": "11.0.0",
   "private": true,
-  "description": "Proxy HTTPS seguro para Pixel IPTV con catálogo category_id y diagnóstico de audio AAC explícito",
+  "description": "Proxy HTTPS estable para Pixel IPTV con audio AAC TS-first y fallback HLS",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
