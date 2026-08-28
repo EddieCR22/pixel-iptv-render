@@ -22,7 +22,7 @@ const UPSTREAM_STREAM_TIMEOUT_MS = 18_000;
 const IMAGE_TIMEOUT_MS = 12_000;
 const MAX_JSON_BODY = 256 * 1024;
 const AUDIO_FIX_START_TIMEOUT_MS = 25_000;
-const AUDIO_FIX_PROXY_UA = "Pixel-IPTV-AudioFix-V007";
+const AUDIO_FIX_PROXY_UA = "Pixel-IPTV-AudioFix-V009";
 const MAX_ACTIVE_TRANSCODES = Math.max(1, Math.min(4, Number(process.env.MAX_ACTIVE_TRANSCODES || 2)));
 
 const loginBuckets = new Map();
@@ -433,8 +433,19 @@ function proxyToken(targetUrl, session, profileId = "") {
   });
 }
 function publicBase(req) {
-  const proto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
-  const host = req.headers.host;
+  const host = String(req.headers.host || "").trim();
+  const hostname = host.replace(/^\[/, "").replace(/\].*$/, "").split(":")[0].toLowerCase();
+  const remote = String(req.socket?.remoteAddress || "").replace(/^::ffff:/, "").toLowerCase();
+  const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" ||
+    remote === "127.0.0.1" || remote === "::1";
+
+  // V009: las playlists solicitadas por FFmpeg mediante loopback deben reescribir
+  // también sus segmentos a HTTP loopback. Si no, el valor por defecto HTTPS
+  // hace que FFmpeg intente TLS contra el servidor HTTP interno de Node y falle
+  // con "An unexpected TLS packet was received".
+  const proto = loopback
+    ? "http"
+    : String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
   return `${proto}://${host}`;
 }
 function rewriteManifest(text, manifestUrl, req, session, profileId = "") {
@@ -887,7 +898,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V008",
+        version: "V009",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -902,6 +913,7 @@ async function route(req, res) {
         proxiedHlsAudioSource: true,
         audioFixLoopback: true,
         audioFixDiagnostics: true,
+        audioFixLoopbackSchemeFix: true,
         ffmpegConfigured: !!ffmpegPath,
         activeTranscodes,
         maxActiveTranscodes: MAX_ACTIVE_TRANSCODES
