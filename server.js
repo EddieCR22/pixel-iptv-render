@@ -2,6 +2,8 @@
 
 const http = require("http");
 const { Readable } = require("stream");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
@@ -19,8 +21,11 @@ const UPSTREAM_JSON_TIMEOUT_MS = 15_000;
 const UPSTREAM_STREAM_TIMEOUT_MS = 18_000;
 const IMAGE_TIMEOUT_MS = 12_000;
 const MAX_JSON_BODY = 256 * 1024;
+const AUDIO_FIX_START_TIMEOUT_MS = 25_000;
+const MAX_ACTIVE_TRANSCODES = Math.max(1, Math.min(4, Number(process.env.MAX_ACTIVE_TRANSCODES || 2)));
 
 const loginBuckets = new Map();
+let activeTranscodes = 0;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -572,7 +577,7 @@ async function handleTicket(req, res, url) {
   const ext = safeExt(body.ext || "mp4");
   const requestedMode = String(body.mode || "").toLowerCase();
   const mode = kind === "live"
-    ? (requestedMode === "ts" ? "ts" : "hls")
+    ? (["ts","audiofix"].includes(requestedMode) ? requestedMode : "hls")
     : (["hls","ts","mp4"].includes(requestedMode) ? requestedMode : "direct");
   const exp = Math.min(Number(s.exp || 0), Date.now() + STREAM_TICKET_MS);
   const ticket = seal({ scope: "stream", u: s.u, p: s.p, kind, id, ext, mode, sessionExp: s.exp, exp });
@@ -592,13 +597,149 @@ function streamSessionFromUrl(url, kind, id) {
   throw new HttpError(401, "Falta autorización de reproducción");
 }
 
+
+async function resolveLiveHlsInput(session, id, req) {
+  const candidates = streamCandidates(session, "live", id, "m3u8", "hls");
+  const attempts = [];
+  let lastStatus = 502;
+
+  for (const target of candidates) {
+    const tried = await tryTargetProfiles(target, req);
+    attempts.push(...tried.attempts.map(a => ({ ...a, target })));
+    if (!tried.response || !tried.response.ok) {
+      const statuses = tried.attempts.map(a => a.status).filter(Boolean);
+      if (statuses.length) lastStatus = statuses[statuses.length - 1];
+      continue;
+    }
+    const r = tried.response;
+    const finalUrl = r.url || target;
+    const ct = r.headers.get("content-type") || "";
+    const profile = tried.profile || profileById("vlc");
+    const isManifest = looksLikeManifest(ct, finalUrl);
+    try { await r.body?.cancel(); } catch {}
+    if (isManifest) return { url: finalUrl, profile, attempts };
+    lastStatus = 415;
+  }
+
+  const seen = attempts.map(a => `${a.profile}:${a.status || "ERR"}`).join(",");
+  const err = new HttpError(lastStatus || 502, "No se pudo abrir la fuente HLS para corregir el audio");
+  err.attemptSummary = seen.slice(0, 500);
+  throw err;
+}
+
+function ffmpegHeaderBlock(profile) {
+  const lines = [];
+  if (profile?.referer) lines.push(`Referer: ${profile.referer}`);
+  if (profile?.origin) lines.push(`Origin: ${profile.origin}`);
+  lines.push("Accept-Language: es-419,es;q=0.9,en;q=0.7");
+  return lines.join("\r\n") + "\r\n";
+}
+
+async function handleLiveAudioFix(req, res, session, id) {
+  if (!ffmpegPath) throw new HttpError(503, "FFmpeg no está disponible en el servidor");
+  if (activeTranscodes >= MAX_ACTIVE_TRANSCODES) {
+    throw new HttpError(429, "El modo de corrección de audio está ocupado. Intenta de nuevo en unos segundos.");
+  }
+
+  const resolved = await resolveLiveHlsInput(session, id, req);
+  const profile = resolved.profile || profileById("vlc");
+  const args = [
+    "-nostdin", "-hide_banner", "-loglevel", "warning",
+    "-rw_timeout", "15000000",
+    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2",
+    "-user_agent", profile.ua || "VLC/3.0.21 LibVLC/3.0.21",
+    "-headers", ffmpegHeaderBlock(profile),
+    "-i", resolved.url,
+    "-map", "0:v:0?", "-map", "0:a:0?",
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+    "-mpegts_flags", "+resend_headers",
+    "-muxdelay", "0", "-muxpreload", "0",
+    "-f", "mpegts", "pipe:1"
+  ];
+
+  activeTranscodes++;
+  const proc = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let settled = false;
+  let headersSent = false;
+  let stderr = "";
+
+  const release = () => {
+    if (settled) return;
+    settled = true;
+    activeTranscodes = Math.max(0, activeTranscodes - 1);
+  };
+  const kill = () => {
+    try { if (!proc.killed) proc.kill("SIGKILL"); } catch {}
+  };
+  const startTimer = setTimeout(() => {
+    if (headersSent) return;
+    kill();
+    release();
+    if (!res.headersSent && !res.destroyed && !res.writableEnded) {
+      sendText(res, "La corrección de audio tardó demasiado en iniciar", 504, {
+        "X-Pixel-Stream-Mode": "audiofix"
+      });
+    }
+  }, AUDIO_FIX_START_TIMEOUT_MS);
+
+  reqCloseGuard(res, () => { clearTimeout(startTimer); kill(); release(); });
+
+  proc.stderr.on("data", chunk => {
+    if (stderr.length < 8000) stderr += chunk.toString("utf8").slice(0, 8000 - stderr.length);
+  });
+
+  proc.stdout.once("data", first => {
+    if (res.destroyed || res.writableEnded) { kill(); release(); return; }
+    clearTimeout(startTimer);
+    headersSent = true;
+    res.writeHead(200, corsHeaders({
+      "Content-Type": "video/mp2t",
+      "Cache-Control": "no-store",
+      "X-Pixel-Stream-Mode": "audiofix",
+      "X-Pixel-Audio-Fix": "aac",
+      "X-Pixel-Header-Profile": profile.id || "",
+      "X-Pixel-Attempts": String(resolved.attempts.length)
+    }));
+    res.write(first);
+    proc.stdout.pipe(res);
+  });
+
+  proc.on("error", err => {
+    clearTimeout(startTimer);
+    release();
+    if (!headersSent && !res.headersSent && !res.destroyed && !res.writableEnded) {
+      sendText(res, `No se pudo iniciar la corrección de audio: ${err.message}`, 502, {"X-Pixel-Stream-Mode":"audiofix"});
+    } else if (!res.destroyed) res.destroy();
+  });
+
+  proc.on("close", code => {
+    clearTimeout(startTimer);
+    release();
+    if (!headersSent) {
+      if (!res.headersSent && !res.destroyed && !res.writableEnded) {
+        const detail = stderr.trim().split(/\r?\n/).slice(-2).join(" | ").slice(0, 500);
+        sendText(res, detail ? `No se pudo corregir el audio: ${detail}` : `FFmpeg terminó sin entregar video (${code ?? "?"})`, 502, {
+          "X-Pixel-Stream-Mode":"audiofix"
+        });
+      }
+      return;
+    }
+    if (!res.destroyed && !res.writableEnded) res.end();
+  });
+}
+
 async function handleStream(req, res, url, kind, id) {
   kind = safeKind(kind); id = safeId(id);
   const s = streamSessionFromUrl(url, kind, id);
   let ext = safeExt(url.searchParams.get("ext") || s.ext || "mp4");
   let mode = String(url.searchParams.get("mode") || s.mode || "").toLowerCase();
-  if (kind === "live") mode = mode === "ts" ? "ts" : "hls";
+  if (kind === "live") mode = ["ts","audiofix"].includes(mode) ? mode : "hls";
   else mode = ["hls","ts","mp4"].includes(mode) ? mode : "direct";
+
+  if (kind === "live" && mode === "audiofix") {
+    return await handleLiveAudioFix(req, res, s, id);
+  }
 
   const candidates = streamCandidates(s, kind, id, ext, mode);
   const allAttempts = [];
@@ -750,7 +891,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V005",
+        version: "V006",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -760,7 +901,11 @@ async function route(req, res) {
         vodCompatibilityFallbacks: true,
         normalizedMediaTypes: true,
         safeStreamShutdown: true,
-        playerRefererConfigured: !!PLAYER_REFERER
+        playerRefererConfigured: !!PLAYER_REFERER,
+        audioTranscodeFallback: true,
+        ffmpegConfigured: !!ffmpegPath,
+        activeTranscodes,
+        maxActiveTranscodes: MAX_ACTIVE_TRANSCODES
       });
     }
 
@@ -799,7 +944,7 @@ server.on("clientError", (err, socket) => {
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V005 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V006 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -811,5 +956,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V005 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V006 escuchando en 0.0.0.0:${PORT}`);
 });

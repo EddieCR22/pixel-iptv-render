@@ -1,4 +1,4 @@
-PIXEL IPTV RENDER V004
+PIXEL IPTV RENDER V006
 
 CORRECCIONES:
 - Corrige una condición que podía cerrar la instancia con status 1 al abandonar streams.
@@ -13,3 +13,6 @@ version: V004
 vodCompatibilityFallbacks: true
 normalizedMediaTypes: true
 safeStreamShutdown: true
+
+
+V006: corrección de audio bajo demanda con FFmpeg -> AAC para canales HLS incompatibles con Chromium.
