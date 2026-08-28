@@ -609,7 +609,18 @@ function buildAudioFixInputUrl(req, session, id) {
     u: session.u, p: session.p, kind: "live", id: String(id),
     ext: "m3u8", mode: "hls", sessionExp: session.sessionExp || session.exp, exp
   });
-  return `${publicBase(req)}/stream/live/${encodeURIComponent(id)}?mode=hls&ticket=${encodeURIComponent(ticket)}`;
+  // V008: FFmpeg entra por loopback al mismo proceso Node. Evita hairpin DNS/TLS
+  // contra el dominio público de Render y conserva exactamente el proxy HLS,
+  // perfiles de cabecera y reescritura de segmentos que ya usa el navegador.
+  return `http://127.0.0.1:${PORT}/stream/live/${encodeURIComponent(id)}?mode=hls&ticket=${encodeURIComponent(ticket)}`;
+}
+
+function sanitizeAudioFixLog(text) {
+  return String(text || "")
+    .replace(/ticket=[^&\s]+/gi, "ticket=[redacted]")
+    .replace(/token=[^&\s]+/gi, "token=[redacted]")
+    .replace(/https?:\/\/[^\s]+/gi, "[url]")
+    .slice(-1600);
 }
 
 async function handleLiveAudioFix(req, res, session, id) {
@@ -633,12 +644,14 @@ async function handleLiveAudioFix(req, res, session, id) {
     "-map", "0:v:0?", "-map", "0:a:0?",
     "-c:v", "copy",
     "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
+    "-af", "aresample=async=1:first_pts=0",
     "-mpegts_flags", "+resend_headers",
     "-muxdelay", "0", "-muxpreload", "0",
     "-f", "mpegts", "pipe:1"
   ];
 
   activeTranscodes++;
+  console.log(`[audiofix] start id=${String(id)} source=loopback-hls active=${activeTranscodes}/${MAX_ACTIVE_TRANSCODES}`);
   const proc = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
   let settled = false;
   let headersSent = false;
@@ -654,6 +667,7 @@ async function handleLiveAudioFix(req, res, session, id) {
   };
   const startTimer = setTimeout(() => {
     if (headersSent) return;
+    console.warn(`[audiofix] timeout id=${String(id)} log=${sanitizeAudioFixLog(stderr)}`);
     kill();
     release();
     if (!res.headersSent && !res.destroyed && !res.writableEnded) {
@@ -673,6 +687,7 @@ async function handleLiveAudioFix(req, res, session, id) {
     if (res.destroyed || res.writableEnded) { kill(); release(); return; }
     clearTimeout(startTimer);
     headersSent = true;
+    console.log(`[audiofix] output id=${String(id)} audioDetected=${/Audio:/i.test(stderr)} log=${sanitizeAudioFixLog(stderr)}`);
     res.writeHead(200, corsHeaders({
       "Content-Type": "video/mp2t",
       "Cache-Control": "no-store",
@@ -686,6 +701,7 @@ async function handleLiveAudioFix(req, res, session, id) {
 
   proc.on("error", err => {
     clearTimeout(startTimer);
+    console.error(`[audiofix] spawn-error id=${String(id)} ${err?.message || err}`);
     release();
     if (!headersSent && !res.headersSent && !res.destroyed && !res.writableEnded) {
       sendText(res, `No se pudo iniciar la corrección automática de audio: ${err.message}`, 502, {"X-Pixel-Stream-Mode":"audiofix"});
@@ -694,6 +710,7 @@ async function handleLiveAudioFix(req, res, session, id) {
 
   proc.on("close", code => {
     clearTimeout(startTimer);
+    console.log(`[audiofix] close id=${String(id)} code=${code ?? "?"} headersSent=${headersSent} audioDetected=${/Audio:/i.test(stderr)} log=${sanitizeAudioFixLog(stderr)}`);
     release();
     if (!headersSent) {
       if (!res.headersSent && !res.destroyed && !res.writableEnded) {
@@ -870,7 +887,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V007",
+        version: "V008",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -883,6 +900,8 @@ async function route(req, res) {
         playerRefererConfigured: !!PLAYER_REFERER,
         audioTranscodeFallback: true,
         proxiedHlsAudioSource: true,
+        audioFixLoopback: true,
+        audioFixDiagnostics: true,
         ffmpegConfigured: !!ffmpegPath,
         activeTranscodes,
         maxActiveTranscodes: MAX_ACTIVE_TRANSCODES
@@ -924,7 +943,7 @@ server.on("clientError", (err, socket) => {
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V006 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V008 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -936,5 +955,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V006 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V008 escuchando en 0.0.0.0:${PORT}`);
 });
