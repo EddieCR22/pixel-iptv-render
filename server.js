@@ -22,8 +22,11 @@ const MAX_JSON_BODY = 256 * 1024;
 
 const loginBuckets = new Map();
 const liveGroupCache = new Map();
+const liveCatalogCache = new Map();
 const LIVE_GROUP_CACHE_MS = 10 * 60 * 1000;
 const LIVE_GROUP_TIMEOUT_MS = 25_000;
+const LIVE_CATALOG_CACHE_MS = 10 * 60 * 1000;
+const LIVE_CATALOG_TIMEOUT_MS = 45_000;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -303,9 +306,269 @@ async function fetchLiveGroups(user, pass) {
   return data;
 }
 
+
+function extinfDisplayName(line) {
+  let quoted = false;
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === `"` || ch === `'`) {
+      if (!quoted) { quoted = true; quote = ch; }
+      else if (quote === ch) { quoted = false; quote = ""; }
+      continue;
+    }
+    if (ch === "," && !quoted) return cleanM3uAttr(line.slice(i + 1));
+  }
+  return "";
+}
+
+function extinfAttrs(line) {
+  const out = {};
+  const re = /([A-Za-z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = re.exec(String(line || "")))) {
+    out[String(m[1] || "").toLowerCase()] = cleanM3uAttr(m[2] ?? m[3] ?? "");
+  }
+  return out;
+}
+
+function playlistEntryKind(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || "").trim());
+    const path = u.pathname.toLowerCase();
+    if (/(^|\/)movie(\/|$)/.test(path)) return "movie";
+    if (/(^|\/)series(\/|$)/.test(path)) return "series";
+    if (/(^|\/)live(\/|$)/.test(path)) return "live";
+    if (/\.(?:ts|m3u8|mpegts|m2ts)$/i.test(path)) return "live";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function parseLiveCatalogM3u(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const entries = [];
+  let pending = null;
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "").trim();
+    if (!line) continue;
+
+    if (line.startsWith("#EXTINF")) {
+      const attrs = extinfAttrs(line);
+      pending = {
+        group: cleanM3uAttr(attrs["group-title"] || ""),
+        name: cleanM3uAttr(extinfDisplayName(line) || attrs["tvg-name"] || ""),
+        logo: String(attrs["tvg-logo"] || "").trim().slice(0, 4096),
+        epg_channel_id: cleanM3uAttr(attrs["tvg-id"] || "")
+      };
+      continue;
+    }
+
+    if (line.startsWith("#")) continue;
+    if (!pending) continue;
+
+    const streamId = streamIdFromPlaylistUrl(line);
+    if (streamId) {
+      entries.push({
+        stream_id: streamId,
+        name: pending.name,
+        stream_icon: pending.logo,
+        epg_channel_id: pending.epg_channel_id,
+        group_title: pending.group,
+        playlist_kind: playlistEntryKind(line)
+      });
+    }
+    pending = null;
+  }
+  return entries;
+}
+
+function categoryKey(value) {
+  return cleanM3uAttr(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function m3uCategoryId(label) {
+  const key = categoryKey(label);
+  if (!key) return "";
+  return "m3u-" + crypto.createHash("sha1").update(key).digest("hex").slice(0, 12);
+}
+
+async function fetchLiveCatalog(user, pass) {
+  const key = liveGroupCacheKey(user, pass);
+  const cached = liveCatalogCache.get(key);
+  if (cached && Date.now() - cached.at < LIVE_CATALOG_CACHE_MS) return cached.data;
+
+  const playlistPromise = (async () => {
+    const r = await fetchWithTimeout(playlistUrl(user, pass), {
+      redirect: "follow",
+      headers: {
+        "Accept": "audio/x-mpegurl,application/x-mpegURL,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": PLAYER_REFERER,
+        "Origin": PLAYER_ORIGIN
+      }
+    }, LIVE_CATALOG_TIMEOUT_MS);
+    const text = await r.text();
+    if (!r.ok) throw new HttpError(r.status >= 400 && r.status < 600 ? r.status : 502, `Lista M3U respondió ${r.status}`);
+    if (!/^\s*#EXTM3U/i.test(text)) throw new HttpError(502, "El servidor IPTV no devolvió una lista M3U válida");
+    return text;
+  })();
+
+  const streamsPromise = fetchJson(playerUrl(user, pass, "get_live_streams")).catch(() => []);
+  const catsPromise = fetchJson(playerUrl(user, pass, "get_live_categories")).catch(() => []);
+
+  let playlistText = "";
+  let playlistError = null;
+  try { playlistText = await playlistPromise; }
+  catch (e) { playlistError = e; }
+
+  const [officialStreamsRaw, officialCatsRaw] = await Promise.all([streamsPromise, catsPromise]);
+  const officialStreams = Array.isArray(officialStreamsRaw) ? officialStreamsRaw : [];
+  const officialCats = Array.isArray(officialCatsRaw) ? officialCatsRaw : [];
+
+  if (!playlistText && !officialStreams.length) {
+    throw playlistError || new HttpError(502, "No se pudo cargar el catálogo de TV en vivo");
+  }
+
+  const officialById = new Map();
+  for (const item of officialStreams) {
+    const id = String(item?.stream_id ?? "").trim();
+    if (id) officialById.set(id, item);
+  }
+
+  const officialCategoryName = new Map();
+  for (const c of officialCats) {
+    const id = String(c?.category_id ?? c?.id ?? "").trim();
+    const label = cleanM3uAttr(c?.category_name ?? c?.name ?? "");
+    if (id && label) officialCategoryName.set(id, label);
+  }
+
+  const categories = [];
+  const categoryByKey = new Map();
+
+  const ensureCategory = label => {
+    label = cleanM3uAttr(label);
+    if (!label) return "";
+    const keyName = categoryKey(label);
+    if (categoryByKey.has(keyName)) return categoryByKey.get(keyName).category_id;
+    const category = { category_id: m3uCategoryId(label), category_name: label };
+    categoryByKey.set(keyName, category);
+    categories.push(category);
+    return category.category_id;
+  };
+
+  const channels = new Map();
+  const addChannel = (base, categoryId) => {
+    const id = String(base?.stream_id ?? "").trim();
+    if (!id) return;
+    let item = channels.get(id);
+    if (!item) {
+      item = {
+        stream_id: id,
+        name: cleanM3uAttr(base?.name || "") || `Canal ${id}`,
+        stream_icon: String(base?.stream_icon || "").trim().slice(0, 4096),
+        epg_channel_id: cleanM3uAttr(base?.epg_channel_id || ""),
+        category_id: categoryId || "",
+        category_ids: [],
+        group_title: cleanM3uAttr(base?.group_title || "")
+      };
+      channels.set(id, item);
+    } else {
+      if (!item.stream_icon && base?.stream_icon) item.stream_icon = String(base.stream_icon).trim().slice(0, 4096);
+      if (!item.epg_channel_id && base?.epg_channel_id) item.epg_channel_id = cleanM3uAttr(base.epg_channel_id);
+      if ((!item.name || /^Canal \d+$/i.test(item.name)) && base?.name) item.name = cleanM3uAttr(base.name);
+      if (!item.group_title && base?.group_title) item.group_title = cleanM3uAttr(base.group_title);
+    }
+    if (categoryId && !item.category_ids.includes(categoryId)) item.category_ids.push(categoryId);
+    if (!item.category_id && item.category_ids.length) item.category_id = item.category_ids[0];
+  };
+
+  let parsedEntries = [];
+  if (playlistText) {
+    parsedEntries = parseLiveCatalogM3u(playlistText);
+    for (const entry of parsedEntries) {
+      const official = officialById.get(String(entry.stream_id));
+      const keep =
+        entry.playlist_kind === "live" ||
+        (entry.playlist_kind === "unknown" && officialById.has(String(entry.stream_id)));
+
+      if (!keep) continue;
+
+      const officialCatId = String(official?.category_id ?? "").trim();
+      const fallbackLabel = officialCategoryName.get(officialCatId) || "";
+      const label = entry.group_title || fallbackLabel || "Sin categoría";
+      const cid = ensureCategory(label);
+
+      addChannel({
+        stream_id: entry.stream_id,
+        name: entry.name || official?.name || "",
+        stream_icon: entry.stream_icon || official?.stream_icon || "",
+        epg_channel_id: entry.epg_channel_id || official?.epg_channel_id || "",
+        group_title: label
+      }, cid);
+    }
+  }
+
+  for (const official of officialStreams) {
+    const id = String(official?.stream_id ?? "").trim();
+    if (!id) continue;
+
+    // Si el canal ya vino del M3U, conservamos exclusivamente la agrupación
+    // del M3U y usamos Xtream solo para completar logo/EPG/nombre faltante.
+    if (channels.has(id)) {
+      addChannel({
+        stream_id: id,
+        name: official?.name || "",
+        stream_icon: official?.stream_icon || "",
+        epg_channel_id: official?.epg_channel_id || "",
+        group_title: ""
+      }, "");
+      continue;
+    }
+
+    const catRawId = String(official?.category_id ?? "").trim();
+    const label = officialCategoryName.get(catRawId) || cleanM3uAttr(official?.category_name || "") || "Sin categoría";
+    const cid = ensureCategory(label);
+
+    addChannel({
+      stream_id: id,
+      name: official?.name || "",
+      stream_icon: official?.stream_icon || "",
+      epg_channel_id: official?.epg_channel_id || "",
+      group_title: label
+    }, cid);
+  }
+
+  const streams = [...channels.values()];
+  const used = new Set(streams.flatMap(x => x.category_ids || []).filter(Boolean));
+  const visibleCategories = categories.filter(c => used.has(c.category_id));
+
+  const data = {
+    source: playlistText ? "m3u-authoritative" : "xtream-fallback",
+    categories: visibleCategories,
+    streams,
+    counts: {
+      categories: visibleCategories.length,
+      streams: streams.length,
+      playlist_entries: parsedEntries.length,
+      xtream_streams: officialStreams.length
+    }
+  };
+
+  liveCatalogCache.set(key, { at: Date.now(), data });
+  if (liveCatalogCache.size > 100) {
+    const oldest = [...liveCatalogCache.entries()].sort((a,b) => a[1].at - b[1].at).slice(0, liveCatalogCache.size - 100);
+    for (const [k] of oldest) liveCatalogCache.delete(k);
+  }
+
+  return data;
+}
+
 function allowedAction(action) {
   return new Set([
-    "get_live_categories", "get_live_streams", "get_live_groups",
+    "get_live_categories", "get_live_streams", "get_live_groups", "get_live_catalog",
     "get_vod_categories", "get_vod_streams",
     "get_series_categories", "get_series",
     "get_vod_info", "get_series_info", "get_short_epg"
@@ -650,6 +913,10 @@ async function handleData(req, res, url) {
     const data = await fetchLiveGroups(s.u, s.p);
     return sendJson(res, data);
   }
+  if (action === "get_live_catalog") {
+    const data = await fetchLiveCatalog(s.u, s.p);
+    return sendJson(res, data);
+  }
 
   const extra = {};
   if (action === "get_vod_info") extra.vod_id = safeId(body.vod_id);
@@ -854,7 +1121,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V013",
+        version: "V014",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -866,6 +1133,8 @@ async function route(req, res) {
         safeStreamShutdown: true,
         playerRefererConfigured: !!PLAYER_REFERER,
         m3uLiveGroups: true,
+        m3uAuthoritativeLiveCatalog: true,
+        liveCatalogEndpoint: "get_live_catalog",
         playerCodeUnchangedFromV005: true
       });
     }
