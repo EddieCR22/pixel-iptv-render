@@ -438,31 +438,58 @@ async function fetchLiveCatalog(user, pass) {
     if (id) officialById.set(id, item);
   }
 
-  const officialCategoryName = new Map();
-  for (const c of officialCats) {
-    const id = String(c?.category_id ?? c?.id ?? "").trim();
-    const label = cleanM3uAttr(c?.category_name ?? c?.name ?? "");
-    if (id && label) officialCategoryName.set(id, label);
-  }
-
+  // V015: la categoría oficial de Xtream y el group-title del M3U son
+  // membresías COMPLEMENTARIAS. V014 reemplazaba la oficial por la del M3U
+  // cuando el canal existía en ambas fuentes, lo que reducía el catálogo a
+  // los pocos grupos M3U visibles (p.ej. ~28) aunque Xtream tuviera muchos más.
   const categories = [];
   const categoryByKey = new Map();
+  const officialCanonicalByRawId = new Map();
 
-  const ensureCategory = label => {
-    label = cleanM3uAttr(label);
+  const ensureCategory = (rawLabel, preferredId = "") => {
+    const label = cleanM3uAttr(rawLabel);
     if (!label) return "";
     const keyName = categoryKey(label);
+    if (!keyName) return "";
     if (categoryByKey.has(keyName)) return categoryByKey.get(keyName).category_id;
-    const category = { category_id: m3uCategoryId(label), category_name: label };
+
+    const preferred = String(preferredId || "").trim();
+    const id = preferred || m3uCategoryId(label);
+    if (!id) return "";
+
+    const category = { category_id: id, category_name: label };
     categoryByKey.set(keyName, category);
     categories.push(category);
-    return category.category_id;
+    return id;
+  };
+
+  // Registrar primero TODAS las categorías oficiales y conservar su orden/ID.
+  for (const c of officialCats) {
+    const rawId = String(c?.category_id ?? c?.id ?? "").trim();
+    const label = cleanM3uAttr(c?.category_name ?? c?.name ?? "");
+    if (!label) continue;
+    const canonicalId = ensureCategory(label, rawId);
+    if (rawId && canonicalId) officialCanonicalByRawId.set(rawId, canonicalId);
+  }
+
+  const officialCategoryForStream = official => {
+    const rawId = String(official?.category_id ?? "").trim();
+    if (!rawId) return "";
+    if (officialCanonicalByRawId.has(rawId)) return officialCanonicalByRawId.get(rawId);
+
+    // Algunos paneles devuelven category_id en streams pero omiten esa entrada
+    // en get_live_categories. No la perdemos: usamos el nombre si viene incluido.
+    const label = cleanM3uAttr(official?.category_name || official?.category || `Categoría ${rawId}`);
+    const canonicalId = ensureCategory(label, rawId);
+    if (canonicalId) officialCanonicalByRawId.set(rawId, canonicalId);
+    return canonicalId;
   };
 
   const channels = new Map();
-  const addChannel = (base, categoryId) => {
+  const addChannel = (base, categoryIds = []) => {
     const id = String(base?.stream_id ?? "").trim();
     if (!id) return;
+
     let item = channels.get(id);
     if (!item) {
       item = {
@@ -470,7 +497,7 @@ async function fetchLiveCatalog(user, pass) {
         name: cleanM3uAttr(base?.name || "") || `Canal ${id}`,
         stream_icon: String(base?.stream_icon || "").trim().slice(0, 4096),
         epg_channel_id: cleanM3uAttr(base?.epg_channel_id || ""),
-        category_id: categoryId || "",
+        category_id: "",
         category_ids: [],
         group_title: cleanM3uAttr(base?.group_title || "")
       };
@@ -481,79 +508,90 @@ async function fetchLiveCatalog(user, pass) {
       if ((!item.name || /^Canal \d+$/i.test(item.name)) && base?.name) item.name = cleanM3uAttr(base.name);
       if (!item.group_title && base?.group_title) item.group_title = cleanM3uAttr(base.group_title);
     }
-    if (categoryId && !item.category_ids.includes(categoryId)) item.category_ids.push(categoryId);
+
+    for (const rawCid of Array.isArray(categoryIds) ? categoryIds : [categoryIds]) {
+      const cid = String(rawCid || "").trim();
+      if (cid && !item.category_ids.includes(cid)) item.category_ids.push(cid);
+    }
     if (!item.category_id && item.category_ids.length) item.category_id = item.category_ids[0];
   };
 
   let parsedEntries = [];
   if (playlistText) {
     parsedEntries = parseLiveCatalogM3u(playlistText);
+
     for (const entry of parsedEntries) {
-      const official = officialById.get(String(entry.stream_id));
+      const id = String(entry.stream_id || "");
+      const official = officialById.get(id);
       const keep =
         entry.playlist_kind === "live" ||
-        (entry.playlist_kind === "unknown" && officialById.has(String(entry.stream_id)));
-
+        (entry.playlist_kind === "unknown" && !!official);
       if (!keep) continue;
 
-      const officialCatId = String(official?.category_id ?? "").trim();
-      const fallbackLabel = officialCategoryName.get(officialCatId) || "";
-      const label = entry.group_title || fallbackLabel || "Sin categoría";
-      const cid = ensureCategory(label);
+      const memberships = [];
+      const officialCid = official ? officialCategoryForStream(official) : "";
+      if (officialCid) memberships.push(officialCid);
+
+      const m3uLabel = cleanM3uAttr(entry.group_title || "");
+      const m3uCid = m3uLabel ? ensureCategory(m3uLabel) : "";
+      if (m3uCid && !memberships.includes(m3uCid)) memberships.push(m3uCid);
+
+      if (!memberships.length) {
+        memberships.push(ensureCategory("Sin categoría"));
+      }
 
       addChannel({
-        stream_id: entry.stream_id,
+        stream_id: id,
         name: entry.name || official?.name || "",
         stream_icon: entry.stream_icon || official?.stream_icon || "",
         epg_channel_id: entry.epg_channel_id || official?.epg_channel_id || "",
-        group_title: label
-      }, cid);
+        group_title: m3uLabel || cleanM3uAttr(official?.category_name || "")
+      }, memberships);
     }
   }
 
+  // Completar desde Xtream y, MUY IMPORTANTE, añadir SIEMPRE la membresía
+  // oficial incluso si el canal ya había aparecido en el M3U.
   for (const official of officialStreams) {
     const id = String(official?.stream_id ?? "").trim();
     if (!id) continue;
 
-    // Si el canal ya vino del M3U, conservamos exclusivamente la agrupación
-    // del M3U y usamos Xtream solo para completar logo/EPG/nombre faltante.
-    if (channels.has(id)) {
-      addChannel({
-        stream_id: id,
-        name: official?.name || "",
-        stream_icon: official?.stream_icon || "",
-        epg_channel_id: official?.epg_channel_id || "",
-        group_title: ""
-      }, "");
-      continue;
-    }
-
-    const catRawId = String(official?.category_id ?? "").trim();
-    const label = officialCategoryName.get(catRawId) || cleanM3uAttr(official?.category_name || "") || "Sin categoría";
-    const cid = ensureCategory(label);
+    let officialCid = officialCategoryForStream(official);
+    if (!officialCid) officialCid = ensureCategory("Sin categoría");
 
     addChannel({
       stream_id: id,
       name: official?.name || "",
       stream_icon: official?.stream_icon || "",
       epg_channel_id: official?.epg_channel_id || "",
-      group_title: label
-    }, cid);
+      group_title: cleanM3uAttr(official?.category_name || "")
+    }, [officialCid]);
   }
 
   const streams = [...channels.values()];
   const used = new Set(streams.flatMap(x => x.category_ids || []).filter(Boolean));
   const visibleCategories = categories.filter(c => used.has(c.category_id));
 
+  const m3uCategoryKeys = new Set(
+    parsedEntries
+      .filter(e => e.playlist_kind === "live" || (e.playlist_kind === "unknown" && officialById.has(String(e.stream_id))))
+      .map(e => categoryKey(e.group_title))
+      .filter(Boolean)
+  );
+
   const data = {
-    source: playlistText ? "m3u-authoritative" : "xtream-fallback",
+    source: playlistText ? "xtream+m3u-union" : "xtream-fallback",
     categories: visibleCategories,
     streams,
     counts: {
       categories: visibleCategories.length,
       streams: streams.length,
       playlist_entries: parsedEntries.length,
-      xtream_streams: officialStreams.length
+      xtream_streams: officialStreams.length,
+      xtream_categories: officialCats.length,
+      m3u_categories: m3uCategoryKeys.size,
+      categorized_streams: streams.filter(x => Array.isArray(x.category_ids) && x.category_ids.length).length,
+      multi_category_streams: streams.filter(x => Array.isArray(x.category_ids) && x.category_ids.length > 1).length
     }
   };
 
@@ -1121,7 +1159,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V014",
+        version: "V015",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -1133,7 +1171,9 @@ async function route(req, res) {
         safeStreamShutdown: true,
         playerRefererConfigured: !!PLAYER_REFERER,
         m3uLiveGroups: true,
-        m3uAuthoritativeLiveCatalog: true,
+        m3uAuthoritativeLiveCatalog: false,
+        unionXtreamAndM3uCategories: true,
+        preservesOfficialCategoryMembership: true,
         liveCatalogEndpoint: "get_live_catalog",
         playerCodeUnchangedFromV005: true
       });
