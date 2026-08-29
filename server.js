@@ -21,6 +21,9 @@ const IMAGE_TIMEOUT_MS = 12_000;
 const MAX_JSON_BODY = 256 * 1024;
 
 const loginBuckets = new Map();
+const liveGroupCache = new Map();
+const LIVE_GROUP_CACHE_MS = 10 * 60 * 1000;
+const LIVE_GROUP_TIMEOUT_MS = 25_000;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -204,9 +207,105 @@ function sessionFromReq(req, url) {
   return unseal(authTokenFromReq(req, url), "session");
 }
 
+
+function playlistUrl(user, pass) {
+  const u = new URL(UPSTREAM_BASE + "/get.php");
+  u.searchParams.set("username", user);
+  u.searchParams.set("password", pass);
+  u.searchParams.set("type", "m3u_plus");
+  u.searchParams.set("output", "ts");
+  return u.toString();
+}
+
+function liveGroupCacheKey(user, pass) {
+  return crypto.createHash("sha256").update(`${user}\n${pass}`).digest("hex");
+}
+
+function cleanM3uAttr(value) {
+  return String(value || "")
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+function streamIdFromPlaylistUrl(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || "").trim());
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (!parts.length) return "";
+    let last = decodeURIComponent(parts[parts.length - 1] || "");
+    last = last.replace(/\.(?:ts|m3u8|mp4|mkv|avi|mov|mpegts|m2ts)$/i, "");
+    return /^[A-Za-z0-9._-]{1,128}$/.test(last) ? last : "";
+  } catch {
+    return "";
+  }
+}
+
+function parseLiveGroupsM3u(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const entries = [];
+  const categories = [];
+  const seenCategories = new Set();
+  let pendingGroup = "";
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "").trim();
+    if (!line) continue;
+
+    if (line.startsWith("#EXTINF")) {
+      const m = line.match(/group-title\s*=\s*"([^"]*)"/i) || line.match(/group-title\s*=\s*'([^']*)'/i);
+      pendingGroup = cleanM3uAttr(m ? m[1] : "");
+      continue;
+    }
+
+    if (line.startsWith("#")) continue;
+    if (!pendingGroup) continue;
+
+    const streamId = streamIdFromPlaylistUrl(line);
+    if (streamId) {
+      entries.push([streamId, pendingGroup]);
+      const key = pendingGroup.toLocaleLowerCase("es");
+      if (!seenCategories.has(key)) {
+        seenCategories.add(key);
+        categories.push(pendingGroup);
+      }
+    }
+    pendingGroup = "";
+  }
+
+  return { categories, entries };
+}
+
+async function fetchLiveGroups(user, pass) {
+  const key = liveGroupCacheKey(user, pass);
+  const cached = liveGroupCache.get(key);
+  if (cached && Date.now() - cached.at < LIVE_GROUP_CACHE_MS) return cached.data;
+
+  const r = await fetchWithTimeout(playlistUrl(user, pass), {
+    redirect: "follow",
+    headers: {
+      "Accept": "audio/x-mpegurl,application/x-mpegURL,text/plain,*/*",
+      "User-Agent": "Mozilla/5.0"
+    }
+  }, LIVE_GROUP_TIMEOUT_MS);
+
+  const text = await r.text();
+  if (!r.ok) throw new HttpError(r.status >= 400 && r.status < 600 ? r.status : 502, `Lista M3U respondió ${r.status}`);
+  if (!/^\s*#EXTM3U/i.test(text)) throw new HttpError(502, "El servidor IPTV no devolvió una lista M3U válida");
+
+  const data = parseLiveGroupsM3u(text);
+  liveGroupCache.set(key, { at: Date.now(), data });
+  if (liveGroupCache.size > 100) {
+    const oldest = [...liveGroupCache.entries()].sort((a,b) => a[1].at - b[1].at).slice(0, liveGroupCache.size - 100);
+    for (const [k] of oldest) liveGroupCache.delete(k);
+  }
+  return data;
+}
+
 function allowedAction(action) {
   return new Set([
-    "get_live_categories", "get_live_streams",
+    "get_live_categories", "get_live_streams", "get_live_groups",
     "get_vod_categories", "get_vod_streams",
     "get_series_categories", "get_series",
     "get_vod_info", "get_series_info", "get_short_epg"
@@ -547,6 +646,11 @@ async function handleData(req, res, url) {
   const body = await readJsonBody(req);
   const action = String(body.action || "");
   if (!allowedAction(action)) return sendJson(res, { error: "Acción no permitida" }, 400);
+  if (action === "get_live_groups") {
+    const data = await fetchLiveGroups(s.u, s.p);
+    return sendJson(res, data);
+  }
+
   const extra = {};
   if (action === "get_vod_info") extra.vod_id = safeId(body.vod_id);
   if (action === "get_series_info") extra.series_id = safeId(body.series_id);
@@ -750,7 +854,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V005",
+        version: "V013",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -760,7 +864,9 @@ async function route(req, res) {
         vodCompatibilityFallbacks: true,
         normalizedMediaTypes: true,
         safeStreamShutdown: true,
-        playerRefererConfigured: !!PLAYER_REFERER
+        playerRefererConfigured: !!PLAYER_REFERER,
+        m3uLiveGroups: true,
+        playerCodeUnchangedFromV005: true
       });
     }
 
@@ -799,7 +905,7 @@ server.on("clientError", (err, socket) => {
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V005 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V013 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -811,5 +917,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V005 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V013 escuchando en 0.0.0.0:${PORT}`);
 });
