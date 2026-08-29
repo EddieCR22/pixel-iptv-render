@@ -5,6 +5,8 @@ const { Readable } = require("stream");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
 
 const PORT = Number(process.env.PORT || 10000);
 const UPSTREAM_BASE = String(process.env.UPSTREAM_BASE || "").replace(/\/+$/g, "");
@@ -472,17 +474,40 @@ async function fetchLiveCatalog(user, pass) {
     if (rawId && canonicalId) officialCanonicalByRawId.set(rawId, canonicalId);
   }
 
-  const officialCategoryForStream = official => {
-    const rawId = String(official?.category_id ?? "").trim();
-    if (!rawId) return "";
-    if (officialCanonicalByRawId.has(rawId)) return officialCanonicalByRawId.get(rawId);
+  // CORRECCIÓN: muchos paneles Xtream (XUI.one y derivados) devuelven un
+  // canal en VARIAS categorías oficiales a la vez mediante el arreglo
+  // "category_ids", y dejan "category_id" solo como el valor principal/legacy.
+  // La versión anterior únicamente leía "category_id" (singular), así que si
+  // un canal tenía "Costa Rica" solo como categoría secundaria (category_ids)
+  // y no como la principal, esa membresía se perdía por completo. Si NINGÚN
+  // canal tenía a "Costa Rica" como categoría principal, la categoría entera
+  // terminaba con 0 canales asociados y desaparecía del filtro.
+  const officialRawCategoryIds = official => {
+    const out = [];
+    const push = v => {
+      const s = String(v ?? "").trim();
+      if (s && !out.includes(s)) out.push(s);
+    };
+    if (Array.isArray(official?.category_ids)) official.category_ids.forEach(push);
+    push(official?.category_id);
+    return out;
+  };
 
-    // Algunos paneles devuelven category_id en streams pero omiten esa entrada
-    // en get_live_categories. No la perdemos: usamos el nombre si viene incluido.
-    const label = cleanM3uAttr(official?.category_name || official?.category || `Categoría ${rawId}`);
-    const canonicalId = ensureCategory(label, rawId);
-    if (canonicalId) officialCanonicalByRawId.set(rawId, canonicalId);
-    return canonicalId;
+  const officialCategoryIdsForStream = official => {
+    const out = [];
+    for (const rawId of officialRawCategoryIds(official)) {
+      let canonicalId = officialCanonicalByRawId.get(rawId);
+      if (!canonicalId) {
+        // Algunos paneles devuelven category_id en streams pero omiten esa
+        // entrada en get_live_categories. No la perdemos: usamos el nombre
+        // si viene incluido.
+        const label = cleanM3uAttr(official?.category_name || official?.category || `Categoría ${rawId}`);
+        canonicalId = ensureCategory(label, rawId);
+        if (canonicalId) officialCanonicalByRawId.set(rawId, canonicalId);
+      }
+      if (canonicalId && !out.includes(canonicalId)) out.push(canonicalId);
+    }
+    return out;
   };
 
   const channels = new Map();
@@ -529,8 +554,8 @@ async function fetchLiveCatalog(user, pass) {
       if (!keep) continue;
 
       const memberships = [];
-      const officialCid = official ? officialCategoryForStream(official) : "";
-      if (officialCid) memberships.push(officialCid);
+      const officialCids = official ? officialCategoryIdsForStream(official) : [];
+      for (const cid of officialCids) if (!memberships.includes(cid)) memberships.push(cid);
 
       const m3uLabel = cleanM3uAttr(entry.group_title || "");
       const m3uCid = m3uLabel ? ensureCategory(m3uLabel) : "";
@@ -556,8 +581,8 @@ async function fetchLiveCatalog(user, pass) {
     const id = String(official?.stream_id ?? "").trim();
     if (!id) continue;
 
-    let officialCid = officialCategoryForStream(official);
-    if (!officialCid) officialCid = ensureCategory("Sin categoría");
+    let officialCids = officialCategoryIdsForStream(official);
+    if (!officialCids.length) officialCids = [ensureCategory("Sin categoría")];
 
     addChannel({
       stream_id: id,
@@ -565,7 +590,7 @@ async function fetchLiveCatalog(user, pass) {
       stream_icon: official?.stream_icon || "",
       epg_channel_id: official?.epg_channel_id || "",
       group_title: cleanM3uAttr(official?.category_name || "")
-    }, [officialCid]);
+    }, officialCids);
   }
 
   const streams = [...channels.values()];
@@ -820,9 +845,69 @@ function reqCloseGuard(res, fn) {
   res.once("finish", () => { done = true; });
 }
 
+// CORRECCIÓN AUDIO: algunos canales en vivo (p.ej. Teletica y otros canales
+// de Costa Rica) entregan el audio original en AC-3/E-AC-3 (Dolby Digital).
+// Los navegadores no pueden decodificar AC-3 dentro de Media Source
+// Extensions (que es lo que usan hls.js y mpegts.js), así que el video se ve
+// pero el audio queda mudo, sin ningún error visible. La corrección real no
+// puede hacerse en el navegador: hay que retranscodificar solo el audio a
+// AAC en el proxy, dejando el video intacto (copy, sin recomprimir).
+function pipeLiveAudioAsAac(r, res, extraHeaders = {}) {
+  if (res.destroyed || res.writableEnded) { try { r.body?.cancel(); } catch {} return; }
+  if (!r.body) {
+    res.writeHead(r.status, corsHeaders({ "Content-Type": "video/mp2t", ...extraHeaders }));
+    return res.end();
+  }
+
+  const ff = spawn(ffmpegPath, [
+    "-hide_banner", "-loglevel", "error", "-nostdin",
+    "-fflags", "+genpts+discardcorrupt",
+    "-i", "pipe:0",
+    "-map", "0:v:0?", "-map", "0:a:0?",
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+    "-f", "mpegts",
+    "pipe:1"
+  ], { stdio: ["pipe", "pipe", "ignore"] });
+
+  // El tamaño de salida cambia al retranscodificar el audio, así que no se
+  // reutilizan Content-Length/Content-Range/Accept-Ranges del origen.
+  res.writeHead(r.status, corsHeaders({
+    "Content-Type": "video/mp2t",
+    "Cache-Control": "no-store",
+    "Content-Disposition": "inline",
+    ...extraHeaders
+  }));
+
+  let finished = false;
+  const cleanup = () => {
+    if (finished) return;
+    finished = true;
+    try { upstream.destroy(); } catch {}
+    try { ff.stdin.destroy(); } catch {}
+    try { ff.kill("SIGKILL"); } catch {}
+  };
+
+  reqCloseGuard(res, cleanup);
+
+  const upstream = Readable.fromWeb(r.body);
+  upstream.on("error", cleanup);
+  upstream.pipe(ff.stdin);
+  ff.stdin.on("error", () => {});
+
+  ff.stdout.on("error", cleanup);
+  ff.stdout.pipe(res);
+  ff.on("error", cleanup);
+  ff.on("close", () => {
+    finished = true;
+    if (!res.writableEnded) res.end();
+  });
+}
+
 function proxyToken(targetUrl, session, profileId = "") {
   return seal({
     scope: "segment", url: targetUrl, u: session.u, p: session.p, profileId,
+    kind: session.kind || "",
     exp: Math.min(Number(session.sessionExp || session.exp || 0) || (Date.now() + SESSION_MS), Date.now() + SESSION_MS)
   });
 }
@@ -1058,12 +1143,20 @@ async function handleStream(req, res, url, kind, id) {
         ? "video/mp2t"
         : mediaTypeForExt(mode === "mp4" ? "mp4" : ext);
 
-    return pipeWebBody(r, res, {
-      "Content-Type": usableMediaContentType(ct) ? ct : fallbackType,
-      "Content-Disposition": "inline",
+    const streamHeaders = {
       "X-Pixel-Stream-Mode": kind === "live" ? "ts" : mode,
       "X-Pixel-Header-Profile": profile?.id || "",
       "X-Pixel-Attempts": String(allAttempts.length)
+    };
+
+    // En vivo: se retranscodifica el audio a AAC (video intacto) para
+    // canales con audio AC-3/E-AC-3 que el navegador no puede decodificar.
+    if (kind === "live") return pipeLiveAudioAsAac(r, res, streamHeaders);
+
+    return pipeWebBody(r, res, {
+      "Content-Type": usableMediaContentType(ct) ? ct : fallbackType,
+      "Content-Disposition": "inline",
+      ...streamHeaders
     });
   }
 
@@ -1101,6 +1194,11 @@ async function handleSegment(req, res, url) {
     });
   }
   if (looksLikeHtml(ct)) throw new HttpError(415, "El servidor devolvió HTML en lugar de video");
+
+  // En vivo: mismo tratamiento de audio que en handleStream, para que los
+  // segmentos HLS individuales (el camino que usa hls.js) también lleven
+  // audio AAC en vez de AC-3/E-AC-3.
+  if (payload.kind === "live") return pipeLiveAudioAsAac(r, res, { "X-Pixel-Header-Profile": profileId });
   return pipeWebBody(r, res, { "X-Pixel-Header-Profile": profileId });
 }
 
@@ -1159,7 +1257,7 @@ async function route(req, res) {
       return sendJson(res, {
         ok: true,
         service: "Pixel IPTV Render Proxy",
-        version: "V015",
+        version: "V016",
         upstreamConfigured: /^https?:\/\//i.test(UPSTREAM_BASE),
         alternateHeaderProfiles: true,
         alternateStreamPaths: true,
@@ -1174,6 +1272,8 @@ async function route(req, res) {
         m3uAuthoritativeLiveCatalog: false,
         unionXtreamAndM3uCategories: true,
         preservesOfficialCategoryMembership: true,
+        multiCategoryStreamsFromXtream: true,
+        liveAudioTranscodeToAac: true,
         liveCatalogEndpoint: "get_live_catalog",
         playerCodeUnchangedFromV005: true
       });
@@ -1214,7 +1314,7 @@ server.on("clientError", (err, socket) => {
 });
 
 function shutdown(signal) {
-  console.log(`Pixel IPTV Render Proxy V013 cerrando por ${signal}`);
+  console.log(`Pixel IPTV Render Proxy V016 cerrando por ${signal}`);
   server.close(() => process.exit(0));
   setTimeout(() => {
     try { server.closeIdleConnections?.(); } catch {}
@@ -1226,5 +1326,5 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Pixel IPTV Render Proxy V013 escuchando en 0.0.0.0:${PORT}`);
+  console.log(`Pixel IPTV Render Proxy V016 escuchando en 0.0.0.0:${PORT}`);
 });
