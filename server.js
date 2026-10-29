@@ -1198,7 +1198,6 @@ async function handleSegment(req, res, url) {
   // En vivo: mismo tratamiento de audio que en handleStream, para que los
   // segmentos HLS individuales (el camino que usa hls.js) también lleven
   // audio AAC en vez de AC-3/E-AC-3.
-  if (payload.kind === "live") return pipeLiveAudioAsAac(r, res, { "X-Pixel-Header-Profile": profileId });
   return pipeWebBody(r, res, { "X-Pixel-Header-Profile": profileId });
 }
 
